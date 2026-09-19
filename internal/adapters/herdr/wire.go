@@ -39,28 +39,37 @@ type eventEnvelope struct {
 	Data  json.RawMessage `json:"data"`
 }
 
-// agentInfo mirrors the AgentInfo schema of protocol 17. Optional fields
-// are pointers or zero values; the adapter never relies on their presence.
+// agentInfo mirrors the AgentInfo fields the plugin uses. Optional fields are
+// pointers or zero values so newer metadata remains compatible with older
+// Herdr protocols.
+type agentSessionInfo struct {
+	Agent  string `json:"agent"`
+	Kind   string `json:"kind"`
+	Source string `json:"source"`
+	Value  string `json:"value"`
+}
+
 type agentInfo struct {
-	PaneID                 string  `json:"pane_id"`
-	WorkspaceID            string  `json:"workspace_id"`
-	TabID                  string  `json:"tab_id"`
-	TerminalID             string  `json:"terminal_id"`
-	Agent                  string  `json:"agent"`
-	AgentStatus            string  `json:"agent_status"`
-	Name                   *string `json:"name"`
-	DisplayAgent           string  `json:"display_agent"`
-	Title                  string  `json:"title"`
-	TerminalTitle          string  `json:"terminal_title"`
-	TerminalTitleStripped  string  `json:"terminal_title_stripped"`
-	Cwd                    string  `json:"cwd"`
-	ForegroundCwd          string  `json:"foreground_cwd"`
-	Focused                bool    `json:"focused"`
-	Revision               int64   `json:"revision"`
-	StateChangeSeq         int64   `json:"state_change_seq"`
-	InteractiveReady       bool    `json:"interactive_ready"`
-	LaunchPending          bool    `json:"launch_pending"`
-	ScreenDetectionSkipped bool    `json:"screen_detection_skipped"`
+	PaneID                 string            `json:"pane_id"`
+	WorkspaceID            string            `json:"workspace_id"`
+	TabID                  string            `json:"tab_id"`
+	TerminalID             string            `json:"terminal_id"`
+	Agent                  string            `json:"agent"`
+	AgentStatus            string            `json:"agent_status"`
+	Name                   *string           `json:"name"`
+	DisplayAgent           string            `json:"display_agent"`
+	Title                  string            `json:"title"`
+	TerminalTitle          string            `json:"terminal_title"`
+	TerminalTitleStripped  string            `json:"terminal_title_stripped"`
+	Cwd                    string            `json:"cwd"`
+	ForegroundCwd          string            `json:"foreground_cwd"`
+	Focused                bool              `json:"focused"`
+	Revision               int64             `json:"revision"`
+	StateChangeSeq         int64             `json:"state_change_seq"`
+	InteractiveReady       bool              `json:"interactive_ready"`
+	LaunchPending          bool              `json:"launch_pending"`
+	ScreenDetectionSkipped bool              `json:"screen_detection_skipped"`
+	AgentSession           *agentSessionInfo `json:"agent_session"`
 }
 
 type pongResult struct {
@@ -252,6 +261,10 @@ func toDomainAgent(a agentInfo) domain.Agent {
 	if a.Name != nil {
 		name = strings.TrimSpace(*a.Name)
 	}
+	sessionPath := ""
+	if a.AgentSession != nil && a.AgentSession.Kind == "path" {
+		sessionPath = a.AgentSession.Value
+	}
 	return domain.Agent{
 		Key:            domain.Key{PaneID: a.PaneID, TerminalID: a.TerminalID},
 		WorkspaceID:    a.WorkspaceID,
@@ -264,6 +277,7 @@ func toDomainAgent(a agentInfo) domain.Agent {
 		StateChangeSeq: a.StateChangeSeq,
 		Focused:        a.Focused,
 		Cwd:            a.Cwd,
+		SessionPath:    sessionPath,
 	}
 }
 

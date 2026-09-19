@@ -36,6 +36,9 @@ type Agent struct {
 	// source uses it to find the agent's own transcript. Empty when Herdr
 	// does not know it.
 	Cwd string
+	// SessionPath is Herdr's exact local transcript path when the agent
+	// detector exposes one. It avoids guessing among sessions sharing a cwd.
+	SessionPath string
 }
 
 // labelSeparator joins the workspace and the agent part of a label, the

@@ -55,6 +55,22 @@ func TestDecodeAgentListSample(t *testing.T) {
 	}
 }
 
+func TestToDomainAgentSessionPath(t *testing.T) {
+	a := toDomainAgent(agentInfo{
+		Agent: "pi",
+		AgentSession: &agentSessionInfo{
+			Agent: "pi", Kind: "path", Source: "herdr:pi", Value: "/tmp/session.jsonl",
+		},
+	})
+	if a.SessionPath != "/tmp/session.jsonl" {
+		t.Fatalf("SessionPath = %q", a.SessionPath)
+	}
+	unsupported := toDomainAgent(agentInfo{Agent: "pi", AgentSession: &agentSessionInfo{Kind: "id", Value: "opaque"}})
+	if unsupported.SessionPath != "" {
+		t.Fatalf("unsupported SessionPath = %q", unsupported.SessionPath)
+	}
+}
+
 func TestToDomainAgentLabelPriority(t *testing.T) {
 	name := "  reviewer "
 	tests := []struct {

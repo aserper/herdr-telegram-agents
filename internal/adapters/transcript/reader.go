@@ -65,7 +65,7 @@ func (r *Reader) LastReply(ctx context.Context, agent domain.Agent) (domain.Repl
 	if err := ctx.Err(); err != nil {
 		return domain.Reply{}, err
 	}
-	if agent.Kind != kindClaude {
+	if agent.Kind != kindClaude && agent.Kind != kindPi {
 		return domain.Reply{}, fmt.Errorf("%w: unsupported agent %q", domain.ErrNoReply, agent.Kind)
 	}
 	if strings.TrimSpace(agent.Cwd) == "" {
@@ -74,6 +74,9 @@ func (r *Reader) LastReply(ctx context.Context, agent domain.Agent) (domain.Repl
 	home, err := r.home()
 	if err != nil {
 		return domain.Reply{}, fmt.Errorf("%w: home directory: %v", domain.ErrNoReply, err)
+	}
+	if agent.Kind == kindPi {
+		return r.lastPiReply(ctx, home, agent)
 	}
 	dir := filepath.Join(append([]string{home}, append(projectsDir, projectSlug(agent.Cwd))...)...)
 	path, modTime, candidates, err := newestTranscript(dir)

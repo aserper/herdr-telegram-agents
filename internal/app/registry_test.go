@@ -115,6 +115,7 @@ func TestRegistryApplyStatusAndUpdate(t *testing.T) {
 	r := app.NewRegistry(h, testkit.NewFakeClock(t0), nil)
 	first := agent("p1", "t1", "a", domain.StatusWorking)
 	first.Cwd = "/home/op/proj"
+	first.SessionPath = "/home/op/.pi/session.jsonl"
 	h.SetAgents([]domain.Agent{first})
 	if _, err := r.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
@@ -135,6 +136,7 @@ func TestRegistryApplyStatusAndUpdate(t *testing.T) {
 	}
 
 	same := agent("p1", "t1", "a", domain.StatusIdle)
+	same.Cwd = "/home/op/proj"
 	if evs, structural = r.Apply(domain.HerdrEvent{Kind: domain.PaneUpdated, PaneID: "p1", Agent: &same}); structural || len(evs) != 0 {
 		t.Fatalf("identical pane.updated emitted %v", kinds(evs))
 	}
@@ -144,8 +146,8 @@ func TestRegistryApplyStatusAndUpdate(t *testing.T) {
 	if evs, _ = r.Apply(domain.HerdrEvent{Kind: domain.PaneUpdated, PaneID: "p1", Agent: &unnamed}); len(evs) != 0 {
 		t.Fatalf("nameless pane.updated emitted %v", evs)
 	}
-	if a, _ := r.Agent(domain.Key{PaneID: "p1", TerminalID: "t1"}); a.Name != "a" || a.Cwd != "/home/op/proj" {
-		t.Fatalf("name/cwd after nameless pane.updated = %q %q", a.Name, a.Cwd)
+	if a, _ := r.Agent(domain.Key{PaneID: "p1", TerminalID: "t1"}); a.Name != "a" || a.Cwd != "/home/op/proj" || a.SessionPath != "/home/op/.pi/session.jsonl" {
+		t.Fatalf("metadata after nameless pane.updated = %+v", a)
 	}
 	replacement := agent("p1", "t2", "c", domain.StatusWorking)
 	if evs, structural = r.Apply(domain.HerdrEvent{Kind: domain.PaneUpdated, PaneID: "p1", Agent: &replacement}); !structural || len(evs) != 0 {

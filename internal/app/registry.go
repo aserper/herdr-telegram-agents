@@ -239,6 +239,9 @@ func (r *Registry) applyUpdate(ev domain.HerdrEvent) ([]AgentEvent, bool) {
 	if a.Cwd == "" {
 		a.Cwd = old.Cwd
 	}
+	if a.SessionPath == "" {
+		a.SessionPath = old.SessionPath
+	}
 	r.agents[a.Key] = a
 	if !differs(old, a) {
 		return nil, false

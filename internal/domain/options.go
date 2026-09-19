@@ -272,7 +272,7 @@ func buildOptionSpecs() []OptionSpec {
 			Key:         OptionPostsMeta,
 			Group:       GroupPosts,
 			Title:       "Turn summary line",
-			Description: "End every done post with one line from the agent's transcript: how long the turn took, the model, how many files it edited and how many tokens it wrote. Claude Code only; without a transcript the post ends as before.",
+			Description: "End every done post with one line from the agent's transcript: how long the turn took, the model, how many files it edited when available and how many tokens it wrote. Claude Code and Pi; without a transcript the post ends as before.",
 			Kind:        KindBool,
 			Default:     "true",
 		},
