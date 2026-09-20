@@ -98,6 +98,13 @@ updated 21:35
   default) the status line and the mode hint Claude Code draws under the
   dialog are cut from the post; the dialog's own lines never are, so the
   buttons are found as before.
+- A Pi `ask_user` request with two to five choices, no free-form field, no
+  comment, and no multi-select is posted from the active session transcript
+  before screen scraping. Its question, context, and option descriptions
+  are plain text with buttons for the option titles. Those buttons use Pi's
+  documented numeric selection shortcut followed by enter, so they do not
+  trust an unseen local cursor. Other Pi form shapes fall
+  back to terminal parsing unchanged.
 - Pressing ✏️ sends that entry's number, turns the keyboard into `✏️ waiting
   for your text`, answers `now send the text` and posts a quoted `✏️ Type
   something: send the text as your next message` with Telegram's
@@ -123,14 +130,16 @@ updated 21:35
   and `enter` toggles the row under it, the press reads the screen and
   sends the arrows from the `❯` cursor to that row followed by `enter`
   (a renderer without a `Submit` row gets a plain `enter`). The keyboard
-  collapses to `✅ submitted` and the usual read is armed, so Claude Code's
+  collapses to `⏳ submitted · waiting for agent` and the usual read is armed, so Claude Code's
   `Submit answers` / `Cancel` review arrives with its own buttons. When the
   screen no longer shows the multi-select dialog at redraw time (the agent
   moved on) the new screen is posted as usual and the old keyboard is
   retired.
-- A press sends the option's digit as a key (`agent.send_keys`), answers
-  with a short toast, and replaces the keyboard with a single `✅ <n> · <text>`
-  button; pressing that one says `already answered`. The daemon then reads
+- A screen-dialog press sends the option's digit as a key (`agent.send_keys`)
+  and a structured Pi choice sends its documented navigation keys. It answers
+  with a short toast and replaces the keyboard with a single
+  `⏳ <n> · <text> — sent` button, so the topic visibly shows that the choice
+  is with the agent; pressing that one says `already answered`. The daemon then reads
   the screen again after the usual settle delay, so the next question of a
   multi-step dialog is posted with its own buttons.
 - Buttons are removed lazily: before a newer screen is posted for the same
@@ -157,6 +166,19 @@ updated 21:35
   recognised, or the longer one on a tie. Buttons, the duplicate check and
   quiet mode apply to the chosen text as usual; the catch-up on leaving the
   desk never waits, and a button press restarts from a fresh first capture.
+
+## Pi progress draft
+
+After 1.5 seconds of real work, a Pi parent agent gets one silent, editable
+**⏳ Working** draft in its topic. The daemon polls the active root-session
+chain every two seconds, rendering the active tool plus a bounded eight-line
+timeline of completed tools and subagent states. The draft is removed after a
+successful idle turn, leaving the normal final reply as the durable receipt.
+
+Tool arguments, command text, paths, tool output, child-session transcripts
+and subagent prose are never used. The draft is deliberately parent-only: it
+gives visibility without creating noisy child topics or exposing private
+intermediate conversations. Every activity line is capped at 120 runes.
 
 ## Done posts
 
@@ -228,6 +250,13 @@ transcript or no text is found the daemon posts the screen and logs
 never affected: the dialog with its buttons exists only on the screen, and
 neither carries the summary line or the fold.
 
+`/reply` uses the same transcript lookup and Telegram rendering on demand. It
+always chooses the formatted form and, unlike an automatic done post, has no
+five-message cap: the complete reply is split across as many messages as
+needed. The fold and summary-line options still apply. It never falls back to
+a screen, so a missing, unsupported or still-incomplete transcript produces a
+quoted warning instead of unrelated terminal output.
+
 ## Turns and reactions
 
 A **turn** is one exchange with an agent. It starts with the first
@@ -241,22 +270,23 @@ whose start it never saw (daemon started mid-turn) has no duration.
 
 Two things hang on it:
 
-- **Reactions** (`React to prompts`, default off since 0.9.1). Switched
-  on, a plain prompt sent from the topic gets 👀 as soon as `agent.prompt`
-  accepted it, and 👌 replaces it when that turn ends. Short replies to a
-  dialog, `/keys`, forwarded Claude Code commands and button presses get no
-  reaction. A second prompt while the first turn still runs moves the 👌 to
-  the newer message; the older keeps its 👀. Telegram notifies you of the
-  bot's reaction on most phones, so in a group with sound on every prompt
-  rang twice more; a week of use showed the noise outweighs the
-  acknowledgement, hence the default. The log says `reaction skipped
-  reason="posts.reactions off"` at debug level for every prompt while the
-  option is off.
+- **Reactions** (`React to prompts`, default off since 0.9.1). Switched on,
+  every accepted input that can start or resume work gets 👀 immediately:
+  plain prompts, a typed dialog answer, a short reply to a dialog, `/keys`,
+  and forwarded commands. 👌 replaces it when that turn ends. A second input
+  while the first turn still runs moves the 👌 to the newer message; the
+  older keeps its 👀. Button presses acknowledge in place instead: their
+  keyboard changes to `⏳ … — sent` or `⏳ submitted · waiting for agent`,
+  because the button belongs to the bot's question rather than the
+  operator's message. Telegram notifies you of the bot's reaction on most
+  phones, so in a group with sound on every input may ring twice more; this
+  is why the option remains off by default. The log says `reaction skipped
+  reason="posts.reactions off"` at debug level while it is off.
 - **Short turns** (`Skip short done posts`, default `Off`). A done post is
   skipped when the turn lasted less than N seconds, measured from the turn
   start to the done status, blocked time included; the log says `screen
   skipped … reason=short_turn`. A turn with an unknown start posts. Blocked
-  posts, `/screen` and the reactions are not affected, and a skipped post
+  posts, `/screen`, `/reply` and the reactions are not affected, and a skipped post
   leaves no trace, so the same screen posts next time.
 
 ## Options
@@ -289,7 +319,7 @@ The options today:
 
 | Option | Group | What it does |
 |--------|-------|--------------|
-| `Herdr → Telegram sync` | Sync | Default on. Off: the daemon creates, edits and closes no topic and posts no screen until it is on again. Messages, keys, `/screen`, `/status` and presses on existing question buttons keep working, the screen capture keeps running, daemon notices keep posting. Back on: a full resync, like the `resync` action. A daemon that starts with sync off says so in its started notice, in the `/status` header (`🔇 …`), in the `status` action line (`sync=off`) and in the log. |
+| `Herdr → Telegram sync` | Sync | Default on. Off: the daemon creates, edits and closes no topic and posts no screen until it is on again. Messages, keys, `/screen`, `/reply`, `/status` and presses on existing question buttons keep working, the screen capture keeps running, daemon notices keep posting. Back on: a full resync, like the `resync` action. A daemon that starts with sync off says so in its started notice, in the `/status` header (`🔇 …`), in the `status` action line (`sync=off`) and in the log. |
 | `Dashboard in General` | Sync | Default on. One pinned message in General, edited in place and never ringing: every live agent with its status, how long it has been in it and a link to its topic, `updated HH:MM` at the bottom. Off unpins and deletes it. See [The dashboard](#the-dashboard). |
 | `Quiet while at the desk` | Quiet | Default off: every topic edit and screen post goes out at once, sounds included, so a fresh install shows the plugin at work. On: while you are at the desk, topic edits wait and screen posts are silent; everything catches up when you leave. Off means no presence check at all; `/away` and `/here` then answer that quiet mode is off. See [Quiet while at the desk](#quiet-while-at-the-desk). |
 | `Away after` | Quiet | Default 3 min. Minutes without keyboard or mouse input on this machine before you count as away. A value outside the picker's list (say `45`) can be typed into `options.json` by hand. |
@@ -300,7 +330,7 @@ The options today:
 | `Turn summary line` | Posts | Default on. Every done post (`Screen`, `Reply` and `Formatted`) ends with one line from the agent's transcript: `⏱ 4 min · fable-5-1 · ✏️ 3 files · ↑ 12k tokens` (turn duration, model, distinct files edited when available, output tokens). Claude Code and Pi; without a transcript the post ends as before and the log has `turn meta unavailable` at debug. A transcript written before the turn began is skipped. Off: no line and, in `Screen` mode, no transcript read. See [Done posts](#done-posts). |
 | `Fold long replies after` | Posts | Default `20 lines`. A `Reply` or `Formatted` done post whose message part has more lines than this arrives collapsed in Telegram's expandable quote: the first lines and an arrow that opens the rest; the summary line stays visible under it. `Off` never folds; `Screen` posts are never folded. Any integer of lines up to 1000 can be typed into `options.json`. See [Done posts](#done-posts). |
 | `Trim the input frame` | Posts | Default on. Every screen post (done and blocked screens, `/screen`, `/screen all`, the tails of the Claude Code commands, the pager's six lines) loses Claude Code's input frame at the bottom: the `─` rule, the empty `❯` row, the second rule, the status line (`… │ main ✓ │ 14%: …`) and the mode hint (`⏵⏵ auto mode on (shift+tab to cycle)` or `? for shortcuts`). The cut walks up from the bottom and stops at the first line that is none of these, so a dialog and its options are never touched, a `❯` row with typed text is left alone and a screen without the frame (Codex, any other agent) passes through unchanged. The duplicate check runs after the cut, so a screen that differs only in the status line's clock is not posted twice. Off posts the screen as captured. |
-| `React to prompts` | Posts | Default off: prompts are delivered silently. On: 👀 on your message once the agent took the prompt, 👌 when that turn ends (done, or 5 s of idle). Telegram may ring for each reaction, which is why it is off. See [Turns and reactions](#turns-and-reactions). |
+| `React to prompts` | Posts | Default off: inputs are delivered silently. On: 👀 on every accepted prompt, dialog reply, `/keys`, or forwarded command, 👌 when that turn ends (done, or 5 s of idle). A button changes in place to show it was sent and is awaiting the agent. Telegram may ring for each reaction, which is why it is off. See [Turns and reactions](#turns-and-reactions). |
 | `Questions in the bot's chat` | Posts | Default on. A question from an agent is posted into its topic without a sound and sent to you in the private chat with the bot with a sound: the agent's name, the dialog's options or the last six screen lines, and a link to the post. Mute the group in Telegram and only questions ring. Off: the topic post rings, nothing goes to the private chat. Needs a private chat the bot may write to; see [Silence the group](#silence-the-group). |
 | `Question delay` | Posts | Default `Off`. With `5s` … `120s`: after the usual 1.5 s capture the blocked post waits that long more, is dropped when the agent left blocked meanwhile, starts over when a newer question arrived, and otherwise posts the better of the two captures (more options recognised, then the longer text). `Off` posts the first capture at 1.5 s. Any integer of seconds up to 3600 can be typed into `options.json`. See [Questions and buttons](#questions-and-buttons). |
 | `Skip short done posts` | Posts | Default `Off`. With `5s` … `120s`: the done post of a turn shorter than that is skipped (blocked time included; a turn whose start the daemon never saw posts). Blocked posts and reactions are unaffected. Any integer of seconds up to 3600 can be typed into `options.json`. See [Turns and reactions](#turns-and-reactions). |
@@ -341,7 +371,7 @@ the one thing that must ring come from somewhere else.
   in it; a single topic can be muted the same way from its own header.
 - **What still arrives, silently**: the icons keep changing exactly as
   before, the dashboard in General keeps its lines and durations current,
-  done posts, `/screen` replies and daemon notices land in the topics.
+  done posts, `/screen` and `/reply` responses and daemon notices land in the topics.
   Everything is visible as soon as you open the app; nothing makes a sound.
 - **What rings**: a question from an agent. With `Questions in the bot's
   chat` (the `posts.pager` option, default on) the blocked screen is posted
@@ -418,7 +448,7 @@ you can see the plugin working. Tick `Quiet while at the desk` in
 ## Secrets in posts
 
 Every text that leaves the daemon for Telegram (blocked and done posts,
-`/screen` and `/screen all`, the `.txt` document, the follow-up of a
+`/screen`, `/screen all` and `/reply`, the `.txt` document, the follow-up of a
 forwarded Claude Code command, the labels of inline buttons, panel edits)
 passes one redaction step while `Redact secrets` is on:
 

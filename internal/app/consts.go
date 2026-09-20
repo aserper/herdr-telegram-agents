@@ -40,6 +40,13 @@ const (
 	// dropReportInterval is how often the daemon warns about bridge jobs
 	// lost to overflow; each drop itself is logged at debug.
 	dropReportInterval = 1 * time.Minute
+	// activityDraftDelay avoids progress noise for quick Pi turns.
+	activityDraftDelay = 1500 * time.Millisecond
+	// activityDraftLines and activityDraftLineRunes bound the editable
+	// Telegram draft, matching the compact progress-draft approach.
+	activityDraftLines     = 8
+	activityDraftLineRunes = 120
+	// captureInterval is how often the capture reads the screens of
 	// captureInterval is how often the capture reads the screens of
 	// working agents.
 	captureInterval = 1 * time.Second

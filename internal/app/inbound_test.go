@@ -25,6 +25,39 @@ func assertCallsEqual(t *testing.T, tg *testkit.FakeTelegram, want ...string) {
 	}
 }
 
+type deadlineOnceTelegram struct {
+	domain.TelegramGateway
+	fail bool
+}
+
+func (g *deadlineOnceTelegram) Send(ctx context.Context, out domain.Outgoing) (int, error) {
+	if g.fail {
+		g.fail = false
+		return 0, context.DeadlineExceeded
+	}
+	return g.TelegramGateway.Send(ctx, out)
+}
+
+func TestInboundDefersSameTopicReplyUntilTranscriptCompletes(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "pi", domain.StatusDone)
+	gateway := &deadlineOnceTelegram{TelegramGateway: f.tg, fail: true}
+	f.in.tg = gateway
+	f.in.replying[a.Key] = true
+	if err := f.in.reply(f.ctx, 101, 7, "status after reply"); err != nil {
+		t.Fatal(err)
+	}
+	if sent := f.tg.Sent(); len(sent) != 0 || len(f.in.deferredReplies[a.Key]) != 1 {
+		t.Fatalf("sent=%+v deferred=%+v", sent, f.in.deferredReplies)
+	}
+	if err := f.in.ReplyFinished(f.ctx, replyResult{key: a.Key}); err != nil {
+		t.Fatal(err)
+	}
+	if sent := f.tg.Sent(); len(sent) != 1 || sent[0].Text != "status after reply" || sent[0].ReplyTo != 7 {
+		t.Fatalf("flushed replies=%+v", sent)
+	}
+}
+
 func TestInboundPromptAndShortReply(t *testing.T) {
 	f := newBridgeFixture(t)
 	f.reactionsOn(t)
@@ -53,8 +86,9 @@ func TestInboundPromptAndShortReply(t *testing.T) {
 	if k := f.herdr.Keys(); len(k) != 1 || k[0].Target != "p1" || !reflect.DeepEqual(k[0].Keys, []string{"y"}) {
 		t.Fatalf("Keys = %+v", k)
 	}
-	// The prompt reacted, the key press did not; no reply either way.
-	assertCallsEqual(t, f.tg, "react:101:5:👀", "react:101:6:👀")
+	// Every accepted agent input reacts immediately, including a short key
+	// reply to a dialog; no success message competes with the agent UI.
+	assertCallsEqual(t, f.tg, "react:101:5:👀", "react:101:6:👀", "react:101:7:👀")
 }
 
 func TestInboundPromptReacts(t *testing.T) {
@@ -104,6 +138,47 @@ func TestInboundKeysFocusScreen(t *testing.T) {
 		t.Fatalf("Reads = %+v", reads)
 	}
 	assertCallsEqual(t, f.tg, "send:101:the screen", "send:101:the screen")
+}
+
+func TestInboundReplyPostsCompleteFormattedTranscript(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusDone)
+	a.Kind = "pi"
+	f.agents[a.Key] = a
+	text := "# Result\n\n" + strings.Repeat("complete output\n", 1200)
+	meta := domain.TurnMeta{Model: "gpt-test", Started: tb0, Ended: tb0.Add(2 * time.Minute), OutputTokens: 321}
+	f.replies.Set(a.Key, text)
+	f.replies.SetMeta(a.Key, meta, f.clock.Now())
+
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 9, "/reply")); err != nil {
+		t.Fatal(err)
+	}
+	sent := f.tg.Sent()
+	if len(sent) != 2 {
+		t.Fatalf("Sent = %+v", sent)
+	}
+	if got := sent[0]; got.Text != "⏳ preparing the complete transcript reply…" || got.ReplyTo != 9 {
+		t.Fatalf("reply acknowledgement = %+v", got)
+	}
+	got := sent[1]
+	if got.Text != strings.TrimSpace(text) || !got.Markdown || got.Code || got.MaxParts != 0 || got.ReplyTo != 9 || got.Fold != 20 || got.Footer != meta.Line() {
+		t.Fatalf("reply post = %+v", got)
+	}
+	if len(f.herdr.Reads()) != 0 {
+		t.Fatal("/reply must not read the terminal screen")
+	}
+}
+
+func TestInboundReplyUnavailable(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	f.replies.Fail(a.Key, fmt.Errorf("%w: no transcript directory /home/operator/private-project", domain.ErrNoReply))
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 10, "/reply")); err != nil {
+		t.Fatal(err)
+	}
+	if sent := f.tg.Sent(); len(sent) != 2 || sent[0].Text != "⏳ preparing the complete transcript reply…" || sent[1].Text != "⚠️ no complete transcript reply is available" || strings.Contains(sent[1].Text, "/home/") || sent[1].ReplyTo != 10 {
+		t.Fatalf("Sent = %+v", sent)
+	}
 }
 
 func TestInboundStatusHelpUnknown(t *testing.T) {
@@ -785,7 +860,7 @@ func TestInboundStopFailure(t *testing.T) {
 
 func TestInboundControlCommandsInGeneral(t *testing.T) {
 	f := newBridgeFixture(t)
-	for id, text := range map[int]string{1: "/stop", 2: "/interrupt", 3: "/close"} {
+	for id, text := range map[int]string{1: "/stop", 2: "/interrupt", 3: "/close", 4: "/reply"} {
 		if got := general(f, t, id, text); got != topicOnly {
 			t.Errorf("%s in General = %q, want %q", text, got, topicOnly)
 		}
@@ -1398,7 +1473,7 @@ func TestInboundAttachmentAgentGoneAfterDownload(t *testing.T) {
 	a := f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
 	f.tg.SetFile("p", []byte("x"))
 	// The agent disappears while the download runs.
-	f.in.async = func(run func(context.Context) any) {
+	f.in.async = func(_ time.Duration, run func(context.Context) any) {
 		delete(f.agents, a.Key)
 		_ = f.in.asyncDone(f.ctx, run(f.ctx))
 	}

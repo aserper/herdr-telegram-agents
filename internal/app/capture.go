@@ -182,6 +182,18 @@ func (c *Capture) merge(key domain.Key, screen domain.Screen) *domain.History {
 	return h
 }
 
+// Captured returns the already collected history without reading or moving
+// the terminal. Callers that need a fresh capture should use Since instead.
+func (c *Capture) Captured(key domain.Key) (lines []string, marked bool, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	h, found := c.hist[key]
+	if !found || h.Len() == 0 {
+		return nil, false, false
+	}
+	return append([]string(nil), h.Lines()...), h.Marked(), true
+}
+
 // Since reads a fresh screen, merges it and returns the history lines after
 // the last mark (all of them when there is none) and whether a mark exists.
 func (c *Capture) Since(ctx context.Context, key domain.Key) (lines []string, marked bool, err error) {

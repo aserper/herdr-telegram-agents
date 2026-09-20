@@ -19,6 +19,9 @@ const (
 	// screen, otherwise the last Lines lines; All means the output since
 	// the last human message.
 	CmdScreen CommandKind = "screen"
+	// CmdReply posts the complete latest transcript reply with Markdown
+	// formatting. It is available for transcript-backed agents only.
+	CmdReply CommandKind = "reply"
 	// CmdFocus brings the agent's pane to the front in Herdr.
 	CmdFocus CommandKind = "focus"
 	// CmdStatus answers with the agent status (topic) or a summary of every
@@ -415,6 +418,8 @@ func ParseCommand(text, botUsername string) Command {
 	switch word {
 	case "screen":
 		return parseScreen(args)
+	case "reply":
+		return bareCommand(CmdReply, word, args)
 	case "keys":
 		if len(args) == 0 {
 			return Command{Kind: CmdUnknown, Text: "/keys"}

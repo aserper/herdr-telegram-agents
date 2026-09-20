@@ -61,6 +61,7 @@ Anything you write in a topic reaches the agent:
 | `/keys esc enter` | raw key names |
 | `/screen` or `/screen 40` | the visible screen, or its last 40 lines (max 200); the input frame is cut afterwards, so an idle Claude Code pane may answer with fewer than 40 lines |
 | `/screen all` | everything the agent printed since your last message (typed in Herdr or sent here); long output arrives as a `.txt` file |
+| `/reply` | the complete latest Claude Code or Pi reply from its transcript, with headings, lists, links and code formatted for Telegram; split across as many messages as needed |
 | `/focus` | the pane is brought to the front in Herdr |
 | `/git status`, `/git diff`, `/git diff staged`, `/git log [N]` | `git status --short --branch`, `git diff HEAD`, `git diff --cached` or `git log --oneline --decorate -n N` (default 10, at most 50) run by the daemon in the agent's working directory (`cwd` from `agent.list`), colour and pager off, 10 s timeout. Up to 3600 characters come back as a quoted code block; longer output as a `<repo>-<sub>-<hhmmss>.patch` (diff) or `.txt` file with a caption naming the argv and the line count (5 MB cap, `truncated` when cut). Empty output answers `clean`, `no changes` or `no commits`. Anything else after `/git` (a path, a flag, another subcommand) answers `usage: /git status \| diff [staged] \| log [N]`; nothing typed on the phone reaches git. Failures: `⚠️ not a git repository: <cwd>`, `⚠️ git is not installed`, `⚠️ git timed out`, `⚠️ Herdr reports no working directory`. Secret redaction applies to the output like to any post |
 | `/stop` | `esc` through `agent.send_keys`, in any status: Claude Code cancels the running turn or dismisses the open dialog; the reply is `⏹ sent esc` |
@@ -115,6 +116,26 @@ and, when Herdr reports the pane closed, the topic gets 🏁 and closes like
 after any exit. `No` edits it to `not closed`. A second `/close` retires the
 first question's buttons; pressing a retired one answers `not the latest
 question`, pressing after the agent exited answers `agent has exited`.
+
+## `/reply`
+
+`/reply` reads the same transcript source as the `Reply` and `Formatted` done
+post modes, but it is an explicit request for the complete response. It sends
+the latest completed assistant text after the latest user prompt as formatted
+Telegram messages, without the automatic done post's five-message cap. For Pi
+sessions it also appends the latest persistent task list with completed,
+active and pending indicators. The
+`Fold long replies after` and `Turn summary line` settings still apply, and
+secret redaction runs before anything leaves the machine. Delivery continues
+outside the command loop for as long as the daemon runs; a second `/reply` in
+the same topic is refused until the first finishes so their parts cannot mix.
+
+Claude Code and Pi are supported. Pi follows the active transcript parent
+chain and rejects child sessions, abandoned branches, aborted turns and a
+partially written final record. A missing or incomplete reply produces the
+sanitized response `⚠️ no complete transcript reply is available` rather
+than exposing a local transcript path or falling back to a terminal screen.
+`/reply` works in an agent topic only.
 
 ## `/screen all`
 

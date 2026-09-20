@@ -123,6 +123,20 @@ type Gateway struct {
 	// strangerEvery.
 	strangerMu   sync.Mutex
 	lastStranger map[int64]time.Time
+	// sendLocks keeps all parts of one outgoing topic message together while
+	// allowing unrelated topics to share the paced Bot API queue normally.
+	sendLocksMu sync.Mutex
+	sendLocks   map[sendTarget]*topicSendLock
+}
+
+type sendTarget struct {
+	chatID   int64
+	threadID int
+}
+
+type topicSendLock struct {
+	token chan struct{}
+	users int
 }
 
 var _ domain.TelegramGateway = (*Gateway)(nil)
@@ -146,6 +160,7 @@ func NewGateway(api *bot.Bot, cfg Config, queue *Queue, log *slog.Logger) *Gatew
 		log:          log,
 		http:         &http.Client{Timeout: downloadTimeout},
 		lastStranger: map[int64]time.Time{},
+		sendLocks:    map[sendTarget]*topicSendLock{},
 	}
 	g.access.Store(newAccess(cfg.Operators, cfg.Observers))
 	g.noticeDelay.Store(int64(cfg.NoticeDelay))
@@ -382,7 +397,48 @@ func (g *Gateway) SendDirect(ctx context.Context, userID int64, out domain.Outgo
 // split limit reduced by its length so the pair stays under Telegram's
 // cap; a part with more lines than Fold goes out inside an expandable
 // quote, the footer under it.
+// lockTopicSend serializes complete multipart deliveries inside one topic.
+// Waiting honors ctx, so a paced /reply cannot stall the bridge indefinitely.
+// The reference count permits locks for inactive topics to be reclaimed.
+func (g *Gateway) lockTopicSend(ctx context.Context, chatID int64, threadID int) (func(), error) {
+	target := sendTarget{chatID: chatID, threadID: threadID}
+	g.sendLocksMu.Lock()
+	lock := g.sendLocks[target]
+	if lock == nil {
+		lock = &topicSendLock{token: make(chan struct{}, 1)}
+		lock.token <- struct{}{}
+		g.sendLocks[target] = lock
+	}
+	lock.users++
+	g.sendLocksMu.Unlock()
+	select {
+	case <-lock.token:
+	case <-ctx.Done():
+		g.sendLocksMu.Lock()
+		lock.users--
+		if lock.users == 0 {
+			delete(g.sendLocks, target)
+		}
+		g.sendLocksMu.Unlock()
+		return nil, ctx.Err()
+	}
+	return func() {
+		lock.token <- struct{}{}
+		g.sendLocksMu.Lock()
+		lock.users--
+		if lock.users == 0 {
+			delete(g.sendLocks, target)
+		}
+		g.sendLocksMu.Unlock()
+	}, nil
+}
+
 func (g *Gateway) send(ctx context.Context, chatID int64, threadID int, out domain.Outgoing) (int, error) {
+	unlock, err := g.lockTopicSend(ctx, chatID, threadID)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	markdown := out.Markdown && !out.Code && !out.HTML
 	footer := truncateFooter(out.Footer, footerMax)
 	limit := textMax

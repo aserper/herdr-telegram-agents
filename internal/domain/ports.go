@@ -2,6 +2,8 @@ package domain
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -83,7 +85,8 @@ const (
 // from, for logs only. Age is how long ago that file was last written and
 // Written the moment it was (zero when unknown); a file written before
 // the turn started belongs to an earlier turn. Meta is what the transcript
-// says about the turn that produced Text; every field may be empty.
+// says about the turn that produced Text, including an optional task list;
+// every field may be empty.
 type Reply struct {
 	Text    string
 	Source  string
@@ -103,8 +106,105 @@ type TurnMeta struct {
 	Ended        time.Time
 	Files        []string
 	OutputTokens int
+	Tasks        []ReplyTask
 }
 
+// ReplyTask is one item from an agent-managed task list. Status is the
+// agent's stable value: not-started, in-progress or completed.
+type ReplyTask struct {
+	Title  string
+	Status string
+}
+
+// Question is an active structured choice request. Only questions whose
+// input behavior is known are exposed to transports: Choices are 1-based,
+// single-select, and have no free-form fallback.
+type Question struct {
+	ID      string
+	Prompt  string
+	Context string
+	Options []QuestionOption
+}
+
+// QuestionOption preserves the title and explanatory text Pi showed for a
+// structured choice. Title is used on the compact button; Description stays
+// in the post body.
+type QuestionOption struct {
+	Number      int
+	Title       string
+	Description string
+}
+
+// Text renders a question as a conservative Telegram-safe plain-text body.
+func (q Question) Text() string {
+	var b strings.Builder
+	b.WriteString("❓ ")
+	b.WriteString(strings.TrimSpace(q.Prompt))
+	if context := strings.TrimSpace(q.Context); context != "" {
+		b.WriteString("\n\n")
+		b.WriteString(context)
+	}
+	for _, option := range q.Options {
+		fmt.Fprintf(&b, "\n\n%d. %s", option.Number, strings.TrimSpace(option.Title))
+		if description := strings.TrimSpace(option.Description); description != "" {
+			b.WriteString("\n   ")
+			b.WriteString(description)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// Choices returns compact numbered labels for the Telegram keyboard.
+func (q Question) Choices() []Choice {
+	choices := make([]Choice, 0, len(q.Options))
+	for _, option := range q.Options {
+		choices = append(choices, Choice{Number: option.Number, Label: option.Title})
+	}
+	return choices
+}
+
+// QuestionSource finds an active structured interaction for an agent.
+// ErrNoQuestion means that terminal dialog parsing remains the safe fallback.
+type QuestionSource interface {
+	PendingQuestion(context.Context, Agent) (Question, error)
+}
+
+// SubagentActivity is one row about a subagent run on an activity card.
+// Description is the short summary the parent agent gave the run, Type is
+// the subagent kind and Status is the transcript's stable value:
+// running, background, completed, error, steered or stopped. Every field
+// may be empty. Rows are taken only from the structured fields of Agent
+// and subagent tool results, never from tool output.
+type SubagentActivity struct {
+	Description string
+	Type        string
+	Status      string
+}
+
+// ActivitySnapshot is a safe snapshot of what an agent is doing right
+// now, sized for a parent card. ActiveTool is the generic label of the
+// tool the agent is waiting on, empty between calls. RecentTools lists
+// the tools finished in the current turn, newest first, capped to a few.
+// Subagents lists the most recent subagent runs, newest first, also
+// capped. Labels never contain commands, file paths or tool arguments.
+type ActivitySnapshot struct {
+	ActiveTool  string
+	RecentTools []string
+	Subagents   []SubagentActivity
+}
+
+// ActivitySource reports what an agent is doing right now, read from the
+// agent's own transcript. It returns ErrNoActivity, wrapped with the
+// reason, whenever there is no safe snapshot; the caller then omits the
+// activity card.
+type ActivitySource interface {
+	PendingActivity(context.Context, Agent) (ActivitySnapshot, error)
+}
+
+// ReplySource finds the last reply of an agent outside Herdr, in the
+// agent's own session transcript. It returns ErrNoReply, wrapped with the
+// reason, whenever nothing usable exists; the caller then falls back to
+// the screen.
 // ReplySource finds the last reply of an agent outside Herdr, in the
 // agent's own session transcript. It returns ErrNoReply, wrapped with the
 // reason, whenever nothing usable exists; the caller then falls back to

@@ -62,6 +62,15 @@ var (
 	// no text after the last prompt. Wrapped with the reason; the caller
 	// falls back to the screen.
 	ErrNoReply = errors.New("no reply available")
+	// ErrNoQuestion means no safe active structured question exists; the
+	// caller should use terminal dialog parsing instead.
+	ErrNoQuestion = errors.New("no structured question available")
+	// ErrNoActivity means the transcript shows no safe current activity
+	// for the agent: unsupported agent kind, unknown working directory,
+	// no transcript, an idle or aborted turn, or nothing usable in the
+	// scan window. Wrapped with the reason; the caller omits the activity
+	// card instead of guessing.
+	ErrNoActivity = errors.New("no activity available")
 	// ErrFileTooBig means an attachment is larger than the inbox allows or
 	// than Telegram lets a bot download.
 	ErrFileTooBig = errors.New("file is too big")

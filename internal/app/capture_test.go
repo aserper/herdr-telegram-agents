@@ -110,7 +110,6 @@ func TestCaptureRunFiresOnClock(t *testing.T) {
 	cancel()
 	<-done
 }
-
 func TestCaptureGraceAfterLeavingWorking(t *testing.T) {
 	f := newCaptureFixture(t)
 	a := f.agent("p1", domain.StatusWorking)

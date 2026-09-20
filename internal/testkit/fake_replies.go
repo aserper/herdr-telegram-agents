@@ -12,12 +12,14 @@ import (
 // FakeReplies is an in-memory domain.ReplySource: replies and failures are
 // scripted per agent key and every lookup is recorded.
 type FakeReplies struct {
-	mu      sync.Mutex
-	now     func() time.Time
-	replies map[domain.Key]string
-	metas   map[domain.Key]fakeMeta
-	errs    map[domain.Key]error
-	calls   []domain.Key
+	mu         sync.Mutex
+	now        func() time.Time
+	replies    map[domain.Key]string
+	metas      map[domain.Key]fakeMeta
+	errs       map[domain.Key]error
+	questions  map[domain.Key]domain.Question
+	activities map[domain.Key]domain.ActivitySnapshot
+	calls      []domain.Key
 }
 
 // fakeMeta is the scripted turn meta and write time of one key.
@@ -29,7 +31,7 @@ type fakeMeta struct {
 // NewFakeReplies returns an empty source; unscripted keys answer
 // domain.ErrNoReply.
 func NewFakeReplies() *FakeReplies {
-	return &FakeReplies{now: time.Now, replies: map[domain.Key]string{}, metas: map[domain.Key]fakeMeta{}, errs: map[domain.Key]error{}}
+	return &FakeReplies{now: time.Now, replies: map[domain.Key]string{}, metas: map[domain.Key]fakeMeta{}, errs: map[domain.Key]error{}, questions: map[domain.Key]domain.Question{}, activities: map[domain.Key]domain.ActivitySnapshot{}}
 }
 
 // SetNow replaces the clock behind the default Written of a reply scripted
@@ -67,6 +69,20 @@ func (f *FakeReplies) Fail(key domain.Key, err error) {
 	delete(f.metas, key)
 }
 
+// SetQuestion scripts an active structured question for key.
+func (f *FakeReplies) SetQuestion(key domain.Key, question domain.Question) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.questions[key] = question
+}
+
+// SetActivity scripts a safe in-turn activity snapshot for key.
+func (f *FakeReplies) SetActivity(key domain.Key, snapshot domain.ActivitySnapshot) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.activities[key] = snapshot
+}
+
 // Calls returns the keys looked up so far, in order.
 func (f *FakeReplies) Calls() []domain.Key {
 	f.mu.Lock()
@@ -91,4 +107,24 @@ func (f *FakeReplies) LastReply(_ context.Context, agent domain.Agent) (domain.R
 		return r, nil
 	}
 	return domain.Reply{}, fmt.Errorf("%w: not scripted for %s", domain.ErrNoReply, agent.Key)
+}
+
+// PendingQuestion implements domain.QuestionSource.
+func (f *FakeReplies) PendingQuestion(_ context.Context, agent domain.Agent) (domain.Question, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if question, ok := f.questions[agent.Key]; ok {
+		return question, nil
+	}
+	return domain.Question{}, fmt.Errorf("%w: not scripted for %s", domain.ErrNoQuestion, agent.Key)
+}
+
+// PendingActivity implements domain.ActivitySource.
+func (f *FakeReplies) PendingActivity(_ context.Context, agent domain.Agent) (domain.ActivitySnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if snapshot, ok := f.activities[agent.Key]; ok {
+		return snapshot, nil
+	}
+	return domain.ActivitySnapshot{}, fmt.Errorf("%w: not scripted for %s", domain.ErrNoActivity, agent.Key)
 }

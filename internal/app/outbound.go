@@ -96,6 +96,14 @@ type outbound struct {
 	refresh map[domain.Key]int
 	// typing holds the open ✏️ wait per agent.
 	typing map[domain.Key]typingWait
+	// activityCards is one delayed, silently edited Pi progress draft per topic.
+	activityCards map[domain.Key]activityCard
+}
+
+type activityCard struct {
+	messageID int
+	hash      string
+	started   time.Time
 }
 
 // pendingCapture is the first screen of a question kept while the blocked
@@ -114,9 +122,13 @@ type pendingCapture struct {
 type keyboard struct {
 	messageID int
 	choices   []domain.Choice
-	multi     bool
-	textEntry int
-	textLabel string
+	// choiceKeys overrides the literal option digit for renderers whose
+	// dialog uses navigation keys (Pi ask_user starts focused on option 1).
+	choiceKeys map[int][]string
+	questionID string
+	multi      bool
+	textEntry  int
+	textLabel  string
 	// cursor and submitRow are the dialog rows last seen on screen (see
 	// domain.Dialog); the Submit press re-reads the screen and falls back
 	// to them when the read fails.
@@ -198,43 +210,155 @@ func newOutbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, chatID in
 		live = func() []domain.Agent { return nil }
 	}
 	return &outbound{
-		herdr:        herdr,
-		tg:           tg,
-		chatID:       chatID,
-		operators:    append([]int64(nil), operators...),
-		pager:        pager,
-		topics:       topics,
-		agents:       agents,
-		live:         live,
-		capture:      capture,
-		clock:        clock,
-		paused:       paused,
-		quiet:        func() bool { return false },
-		posts:        func() domain.PostsMode { return domain.PostsNormal },
-		reannounce:   func() bool { return false },
-		replies:      replies,
-		doneMode:     doneMode,
-		chrome:       chrome,
-		meta:         meta,
-		fold:         fold,
-		log:          log,
-		deb:          newDebouncer(clock, screenSettle, log),
-		lastPosted:   map[domain.Key]string{},
-		keyboards:    map[domain.Key]keyboard{},
-		announced:    map[domain.Key]bool{},
-		turns:        map[domain.Key]turn{},
-		turnDeb:      newDebouncer(clock, turnSettle, log),
-		reactions:    reactions,
-		minTurn:      minTurn,
-		blockedDelay: blockedDelay,
-		captures:     map[domain.Key]pendingCapture{},
-		refresh:      map[domain.Key]int{},
-		typing:       map[domain.Key]typingWait{},
+		herdr:         herdr,
+		tg:            tg,
+		chatID:        chatID,
+		operators:     append([]int64(nil), operators...),
+		pager:         pager,
+		topics:        topics,
+		agents:        agents,
+		live:          live,
+		capture:       capture,
+		clock:         clock,
+		paused:        paused,
+		quiet:         func() bool { return false },
+		posts:         func() domain.PostsMode { return domain.PostsNormal },
+		reannounce:    func() bool { return false },
+		replies:       replies,
+		doneMode:      doneMode,
+		chrome:        chrome,
+		meta:          meta,
+		fold:          fold,
+		log:           log,
+		deb:           newDebouncer(clock, screenSettle, log),
+		lastPosted:    map[domain.Key]string{},
+		keyboards:     map[domain.Key]keyboard{},
+		announced:     map[domain.Key]bool{},
+		turns:         map[domain.Key]turn{},
+		turnDeb:       newDebouncer(clock, turnSettle, log),
+		reactions:     reactions,
+		minTurn:       minTurn,
+		blockedDelay:  blockedDelay,
+		captures:      map[domain.Key]pendingCapture{},
+		refresh:       map[domain.Key]int{},
+		typing:        map[domain.Key]typingWait{},
+		activityCards: map[domain.Key]activityCard{},
 	}
 }
 
 // TurnDue delivers keys whose idle timer fired; call EndTurn for each.
 func (o *outbound) TurnDue() <-chan domain.Key { return o.turnDeb.Due() }
+
+// Activity updates one silent editable card per active Pi topic. It only
+// uses the transcript's safe labels and never posts tool arguments/output.
+func (o *outbound) Activity(ctx context.Context) error {
+	source, ok := o.replies.(domain.ActivitySource)
+	if !ok {
+		return nil
+	}
+	for _, agent := range o.live() {
+		if agent.Kind != "pi" || agent.Status != domain.StatusWorking {
+			continue
+		}
+		entry, ok := o.topics.Entry(agent.Key)
+		if !ok || !entry.Status.Live() || entry.Muted {
+			continue
+		}
+		if questions, ok := o.replies.(domain.QuestionSource); ok {
+			if _, err := questions.PendingQuestion(ctx, agent); err == nil {
+				// Pi keeps the pane working for ask_user, unlike Claude's
+				// blocked dialog. Reuse the existing post-and-button flow.
+				o.deb.Schedule(agent.Key)
+			}
+		}
+		snapshot, err := source.PendingActivity(ctx, agent)
+		if errors.Is(err, domain.ErrNoActivity) {
+			continue
+		}
+		if err != nil {
+			o.log.Debug("pi activity unavailable", slog.String("key", agent.Key.String()), slog.Any("err", err))
+			continue
+		}
+		card, tracked := o.activityCards[agent.Key]
+		if !tracked {
+			card.started = o.clock.Now()
+			o.activityCards[agent.Key] = card
+			continue
+		}
+		if card.messageID == 0 && o.clock.Now().Sub(card.started) < activityDraftDelay {
+			continue
+		}
+		text := activityText(snapshot)
+		hash := hashText(text)
+		if card.messageID != 0 && card.hash == hash {
+			continue
+		}
+		created := card.messageID == 0
+		if card.messageID != 0 {
+			if err := o.tg.EditText(ctx, card.messageID, text, false, nil); err != nil {
+				if isFatal(err) {
+					return err
+				}
+				o.log.Debug("activity card edit deferred", slog.String("key", agent.Key.String()), slog.Any("err", err))
+				continue
+			}
+		} else {
+			id, err := o.tg.Send(ctx, domain.Outgoing{ThreadID: entry.ThreadID, Text: text})
+			if err != nil {
+				if isFatal(err) {
+					return err
+				}
+				o.log.Debug("activity card send deferred", slog.String("key", agent.Key.String()), slog.Any("err", err))
+				continue
+			}
+			card.messageID = id
+		}
+		card.hash = hash
+		o.activityCards[agent.Key] = card
+		o.log.Info("pi progress draft updated", slog.String("key", agent.Key.String()), slog.Int("thread_id", entry.ThreadID), slog.Int("message_id", card.messageID), slog.Bool("created", created))
+	}
+	return nil
+}
+
+func activityText(snapshot domain.ActivitySnapshot) string {
+	lines := []string{"⏳ Working"}
+	if snapshot.ActiveTool != "" {
+		lines = append(lines, "▸ "+snapshot.ActiveTool)
+	}
+	// The transcript gives newest-first; display completed tools in the
+	// natural order so the draft reads as a timeline.
+	for i := len(snapshot.RecentTools) - 1; i >= 0; i-- {
+		lines = append(lines, "✓ "+snapshot.RecentTools[i])
+	}
+	for _, subagent := range snapshot.Subagents {
+		state := "🔄"
+		if subagent.Status == "completed" {
+			state = "✅"
+		} else if subagent.Status == "error" || subagent.Status == "stopped" {
+			state = "⚠️"
+		}
+		label := strings.TrimSpace(subagent.Type)
+		if label == "" {
+			label = "subagent"
+		}
+		if description := strings.TrimSpace(subagent.Description); description != "" {
+			label += " — " + description
+		}
+		lines = append(lines, compactActivityLine(state+" "+label))
+	}
+	if len(lines) > activityDraftLines {
+		lines = append(lines[:1], lines[len(lines)-activityDraftLines+1:]...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func compactActivityLine(text string) string {
+	runes := []rune(text)
+	if len(runes) <= activityDraftLineRunes {
+		return text
+	}
+	return string(runes[:activityDraftLineRunes-1]) + "…"
+}
 
 // SetPagerReachable records whether the bot may write to at least one
 // operator's private chat; the daemon sets it after its start probe. Safe
@@ -342,7 +466,28 @@ func (o *outbound) EndTurn(ctx context.Context, key domain.Key) error {
 		return nil
 	}
 	delete(o.turns, key)
-	return o.finishTurn(ctx, key, t, "idle")
+	if err := o.finishTurn(ctx, key, t, "idle"); err != nil {
+		return err
+	}
+	return o.clearActivity(ctx, key)
+}
+
+// clearActivity removes a successful turn's temporary Pi progress draft.
+// Failure to remove it is non-fatal: the stale draft is less harmful than
+// losing the completed reply, and a later turn always starts a fresh one.
+func (o *outbound) clearActivity(ctx context.Context, key domain.Key) error {
+	card, ok := o.activityCards[key]
+	delete(o.activityCards, key)
+	if !ok || card.messageID == 0 {
+		return nil
+	}
+	if err := o.tg.DeleteMessage(ctx, card.messageID); err != nil {
+		if isFatal(err) {
+			return err
+		}
+		o.log.Debug("pi progress draft cleanup deferred", slog.String("key", key.String()), slog.Int("message_id", card.messageID), slog.Any("err", err))
+	}
+	return nil
 }
 
 // finishTurn logs the end of a turn and pays the ✅ owed on its prompt.
@@ -412,6 +557,14 @@ func (o *outbound) Observe(ev AgentEvent) {
 	switch {
 	case ev.Kind == AgentGone:
 		o.deb.Cancel(key)
+	case ev.Kind == AgentChanged && ev.Agent.Kind == "pi" && ev.Agent.Status == domain.StatusIdle:
+		// Pi reports a completed turn as idle rather than done. Only schedule
+		// this when a locally tracked turn exists, so an initial idle pane
+		// never produces a spurious reply post.
+		if _, open := o.turns[key]; open {
+			o.log.Debug("pi reply scheduled", slog.String("key", key.String()))
+			o.deb.Schedule(key)
+		}
 	case ev.Kind == AgentAppeared && ev.Agent.Status == domain.StatusBlocked,
 		ev.Kind == AgentChanged && (ev.Agent.Status == domain.StatusBlocked || ev.Agent.Status == domain.StatusDone):
 		// A repeated blocked event for the same question (Herdr's pane
@@ -443,6 +596,7 @@ func (o *outbound) Forget(ctx context.Context, key domain.Key) error {
 	delete(o.turns, key)
 	delete(o.captures, key)
 	delete(o.refresh, key)
+	delete(o.activityCards, key)
 	o.endTyping(key, "exited")
 	return o.retire(ctx, key, "exited")
 }
@@ -495,7 +649,19 @@ func (o *outbound) fire(ctx context.Context, key domain.Key, force bool) error {
 	switch agent.Status {
 	case domain.StatusBlocked:
 		lines = blockedLines
+	case domain.StatusWorking:
+		if agent.Kind != "pi" {
+			delete(o.captures, key)
+			return o.skip(key, "not_blocked")
+		}
+		lines = blockedLines
 	case domain.StatusDone:
+		lines = doneLines
+	case domain.StatusIdle:
+		if agent.Kind != "pi" {
+			delete(o.captures, key)
+			return o.skip(key, "not_blocked")
+		}
 		lines = doneLines
 	default:
 		delete(o.captures, key)
@@ -534,15 +700,29 @@ func (o *outbound) fire(ctx context.Context, key domain.Key, force bool) error {
 	// A done post may come from the agent's transcript instead of the
 	// screen; any failure there falls back to the screen with one info line.
 	mode := domain.DoneScreen
-	if agent.Status == domain.StatusDone {
+	if agent.Status == domain.StatusDone || (agent.Kind == "pi" && agent.Status == domain.StatusIdle) {
 		mode = o.doneMode()
 	}
 	var text string
 	var reply domain.Reply
+	var piQuestion *domain.Question
+	if agent.Status == domain.StatusBlocked || (agent.Kind == "pi" && agent.Status == domain.StatusWorking) {
+		if questions, ok := o.replies.(domain.QuestionSource); ok {
+			question, err := questions.PendingQuestion(ctx, agent)
+			switch {
+			case err == nil:
+				piQuestion = &question
+			case !errors.Is(err, domain.ErrNoQuestion):
+				o.log.Debug("pi question unavailable", slog.String("key", key.String()), slog.Any("err", err))
+			}
+		}
+	}
 	// With a blocked delay the first capture waits for a second one; the
 	// catch-up never waits and drops whatever was kept.
 	captured := false
-	if agent.Status == domain.StatusBlocked {
+	if piQuestion != nil {
+		text, captured = piQuestion.Text(), true
+	} else if agent.Status == domain.StatusBlocked {
 		switch delay := o.blockedDelay(); {
 		case force:
 			delete(o.captures, key)
@@ -590,12 +770,16 @@ func (o *outbound) fire(ctx context.Context, key domain.Key, force bool) error {
 		}
 	}
 	if mode == domain.DoneScreen && !captured {
-		screen, err := o.herdr.ReadScreen(ctx, key.PaneID, domain.ScreenDetection, lines)
-		if err != nil {
-			o.log.Warn("screen read failed", slog.String("key", key.String()), slog.String("err", err.Error()))
-			return nil
+		if capturedLines, _, ok := o.capture.Captured(key); ok {
+			text = o.clean(key, strings.Join(capturedLines, "\n"))
+		} else {
+			screen, err := o.herdr.ReadScreen(ctx, key.PaneID, domain.ScreenDetection, lines)
+			if err != nil {
+				o.log.Warn("screen read failed", slog.String("key", key.String()), slog.String("err", err.Error()))
+				return nil
+			}
+			text = o.clean(key, screen.Text)
 		}
-		text = o.clean(key, screen.Text)
 	}
 	if text == "" {
 		return o.skip(key, "empty")
@@ -607,14 +791,21 @@ func (o *outbound) fire(ctx context.Context, key domain.Key, force bool) error {
 	if err := o.retire(ctx, key, "superseded"); err != nil {
 		return err
 	}
-	out := domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Code: mode != domain.DoneFormatted, Markdown: mode == domain.DoneFormatted, Notify: notify, Footer: footer}
+	out := domain.Outgoing{ThreadID: entry.ThreadID, Text: text, Code: mode != domain.DoneFormatted && piQuestion == nil, Markdown: mode == domain.DoneFormatted, Notify: notify, Footer: footer}
 	if mode != domain.DoneScreen {
 		out.MaxParts = replyMaxParts
 		out.Fold = o.fold()
 	}
 	var dialog domain.Dialog
-	if agent.Status == domain.StatusBlocked {
-		dialog = domain.ParseDialog(text)
+	var choiceKeys map[int][]string
+	if agent.Status == domain.StatusBlocked || (agent.Kind == "pi" && agent.Status == domain.StatusWorking) {
+		if piQuestion != nil {
+			choices := piQuestion.Choices()
+			dialog = domain.Dialog{Choices: choices}
+			choiceKeys = piQuestionChoiceKeys(choices)
+		} else {
+			dialog = domain.ParseDialog(text)
+		}
 		out.Buttons = choiceButtons(dialog)
 		o.logChoices(key, dialog)
 	}
@@ -630,7 +821,11 @@ func (o *outbound) fire(ctx context.Context, key domain.Key, force bool) error {
 	}
 	o.lastPosted[key] = hash
 	if len(out.Buttons) > 0 {
-		o.keyboards[key] = keyboard{messageID: id, choices: dialog.Choices, multi: dialog.Multi, textEntry: dialog.TextEntry, textLabel: dialog.TextLabel,
+		questionID := ""
+		if piQuestion != nil {
+			questionID = piQuestion.ID
+		}
+		o.keyboards[key] = keyboard{messageID: id, choices: dialog.Choices, choiceKeys: choiceKeys, questionID: questionID, multi: dialog.Multi, textEntry: dialog.TextEntry, textLabel: dialog.TextLabel,
 			cursor: dialog.Cursor, submitRow: dialog.SubmitRow}
 	}
 	switch {
@@ -927,6 +1122,52 @@ func preHTML(text string) string {
 // digit, a space and the label; data is the digit the agent expects), a
 // "✔ Submit" row for a multi-select dialog (data enter) and a "✏️" row for
 // the free-text entry (data t:<n>).
+// piQuestionChoiceKeys selects an option with Pi ask_user's documented
+// numeric shortcut, then confirms it. Unlike arrow navigation this does not
+// depend on the overlay's currently focused row.
+func piQuestionChoiceKeys(choices []domain.Choice) map[int][]string {
+	keys := make(map[int][]string, len(choices))
+	for _, choice := range choices {
+		keys[choice.Number] = []string{strconv.Itoa(choice.Number), domain.KeyEnter}
+	}
+	return keys
+}
+
+func (o *outbound) activeQuestion(ctx context.Context, agent domain.Agent, kb keyboard) bool {
+	if kb.questionID == "" {
+		return true
+	}
+	questions, ok := o.replies.(domain.QuestionSource)
+	if !ok {
+		return false
+	}
+	question, err := questions.PendingQuestion(ctx, agent)
+	return err == nil && question.ID == kb.questionID
+}
+
+// ShortReplyKeys translates a typed option number only when the cached Pi
+// keyboard still matches the active tool-call ID. stale reports that input
+// must be refused rather than passed through to a changed dialog.
+func (o *outbound) ShortReplyKeys(ctx context.Context, key domain.Key, agent domain.Agent, keys []string) (translated []string, stale bool) {
+	if len(keys) != 1 {
+		return keys, false
+	}
+	n, err := strconv.Atoi(keys[0])
+	if err != nil {
+		return keys, false
+	}
+	kb := o.keyboards[key]
+	if kb.questionID != "" && !o.activeQuestion(ctx, agent, kb) {
+		return nil, true
+	}
+	if kb.questionID != "" {
+		if plan := kb.choiceKeys[n]; len(plan) > 0 {
+			return append([]string(nil), plan...), false
+		}
+	}
+	return keys, false
+}
+
 func choiceButtons(d domain.Dialog) []domain.Button {
 	if len(d.Choices) == 0 {
 		return nil
@@ -1091,12 +1332,22 @@ func (o *outbound) Press(ctx context.Context, ev domain.ButtonPressed) error {
 		}
 		return o.answer(ctx, ev.CallbackID, "agent is not waiting anymore")
 	}
+	if !o.activeQuestion(ctx, agent, kb) {
+		if err := o.retire(ctx, key, "pi_question_changed"); err != nil {
+			return err
+		}
+		return o.answer(ctx, ev.CallbackID, "question changed")
+	}
 	keys := []string{ev.Data}
 	switch kind {
 	case pressText:
 		keys = []string{strconv.Itoa(n)}
 	case pressSubmit:
 		keys = o.submitKeys(ctx, key, kb)
+	case pressDigit:
+		if planned := kb.choiceKeys[n]; len(planned) > 0 {
+			keys = append([]string(nil), planned...)
+		}
 	}
 	if err := o.herdr.SendKeys(ctx, key.PaneID, keys); err != nil {
 		o.log.Warn("button send_keys failed", slog.String("key", key.String()), slog.String("data", ev.Data), slog.String("err", err.Error()))
@@ -1111,7 +1362,7 @@ func (o *outbound) Press(ctx context.Context, ev domain.ButtonPressed) error {
 	case pressSubmit:
 		delete(o.keyboards, key)
 		delete(o.refresh, key)
-		if err := o.absorbEdit(key, o.tg.EditButtons(ctx, ev.MessageID, []domain.Button{{Text: "✅ submitted", Data: doneData}})); err != nil {
+		if err := o.absorbEdit(key, o.tg.EditButtons(ctx, ev.MessageID, []domain.Button{{Text: "⏳ submitted · waiting for agent", Data: doneData}})); err != nil {
 			return err
 		}
 		o.log.Info("dialog submitted", slog.String("key", key.String()), slog.Int("message_id", ev.MessageID))
@@ -1135,7 +1386,7 @@ func (o *outbound) Press(ctx context.Context, ev domain.ButtonPressed) error {
 				label = cutLabel(c.Label)
 			}
 		}
-		pressed := []domain.Button{{Text: "✅ " + ev.Data + " · " + label, Data: doneData}}
+		pressed := []domain.Button{{Text: "⏳ " + ev.Data + " · " + label + " — sent", Data: doneData}}
 		if err := o.absorbEdit(key, o.tg.EditButtons(ctx, ev.MessageID, pressed)); err != nil {
 			return err
 		}
@@ -1242,6 +1493,70 @@ func (o *outbound) absorbEdit(key domain.Key, err error) error {
 	return nil
 }
 
+func appendReplyTasks(text string, tasks []domain.ReplyTask) string {
+	text = strings.TrimSpace(text)
+	if len(tasks) == 0 {
+		return text
+	}
+	var out strings.Builder
+	out.WriteString(text)
+	out.WriteString("\n\n## Tasks\n")
+	for _, task := range tasks {
+		icon := "⬜"
+		switch task.Status {
+		case "completed":
+			icon = "✅"
+		case "in-progress":
+			icon = "🔄"
+		}
+		fmt.Fprintf(&out, "- %s %s\n", icon, strings.TrimSpace(task.Title))
+	}
+	return strings.TrimSpace(out.String())
+}
+
+// Reply posts the agent's complete latest transcript reply as formatted
+// Markdown. Unlike automatic done posts it has no message-part cap: this is
+// an explicit request for the full reply. It ignores mute and duplicate state.
+func (o *outbound) Reply(ctx context.Context, key domain.Key, replyTo int) error {
+	entry, ok := o.topics.Entry(key)
+	if !ok {
+		return fmt.Errorf("reply for %s: no topic", key)
+	}
+	if o.replies == nil {
+		return fmt.Errorf("%w: transcript source unavailable", domain.ErrNoReply)
+	}
+	agent, ok := o.agents(key)
+	if !ok {
+		return domain.ErrAgentGone
+	}
+	reply, err := o.replies.LastReply(ctx, agent)
+	if err != nil {
+		return err
+	}
+	text := appendReplyTasks(reply.Text, reply.Meta.Tasks)
+	if text == "" {
+		return fmt.Errorf("%w: transcript reply is empty", domain.ErrNoReply)
+	}
+	footer := ""
+	if o.meta() {
+		footer = reply.Meta.Line()
+	}
+	if _, err := o.tg.Send(ctx, domain.Outgoing{
+		ThreadID: entry.ThreadID,
+		Text:     text,
+		Markdown: true,
+		ReplyTo:  replyTo,
+		Footer:   footer,
+		Fold:     o.fold(),
+	}); err != nil {
+		return err
+	}
+	o.log.Info("reply posted", slog.String("key", key.String()), slog.Int("thread_id", entry.ThreadID),
+		slog.Int("lines", strings.Count(text, "\n")+1), slog.Int("bytes", len(text)))
+	return nil
+}
+
+// Screen posts the visible screen of an agent on request: the whole screen
 // Screen posts the visible screen of an agent on request: the whole screen
 // when lines is 0, else its last lines. Unlike Fire it ignores the mute
 // flag and the duplicate check because the operator asked for it. Errors
@@ -1268,7 +1583,8 @@ func (o *outbound) Screen(ctx context.Context, key domain.Key, lines int) error 
 }
 
 // ScreenAll posts what the agent printed since the last human message: the
-// captured history after its mark plus the current screen. Short output is
+// captured history after its mark. It reuses the cache without moving the
+// terminal; only an empty cache triggers one fresh capture. Short output is
 // sent as code messages like Screen; longer output goes out as one .txt
 // document so a long exchange does not flood the topic and the queue.
 // Like Screen it ignores the mute flag. Errors are returned so the caller
@@ -1278,9 +1594,13 @@ func (o *outbound) ScreenAll(ctx context.Context, key domain.Key) error {
 	if !ok {
 		return fmt.Errorf("screen all for %s: no topic", key)
 	}
-	lines, marked, err := o.capture.Since(ctx, key)
-	if err != nil {
-		return err
+	lines, marked, ok := o.capture.Captured(key)
+	if !ok {
+		var err error
+		lines, marked, err = o.capture.Since(ctx, key)
+		if err != nil {
+			return err
+		}
 	}
 	text := o.clean(key, strings.Join(lines, "\n"))
 	if text == "" {
@@ -1295,6 +1615,7 @@ func (o *outbound) ScreenAll(ctx context.Context, key domain.Key) error {
 	}
 	n := strings.Count(text, "\n") + 1
 	asDocument := utf8.RuneCountInString(text) > screenAllInlineRunes
+	var err error
 	if asDocument {
 		doc := domain.Document{
 			ThreadID: entry.ThreadID,
@@ -1322,14 +1643,15 @@ func (o *outbound) skip(key domain.Key, reason string) error {
 
 // sendFailed applies the Telegram error policy for posts: fatal bot errors
 // end the daemon, a closed or gone topic is the reconciler's business, and
-// anything else is retried on the next transition.
+// a cancelled or timed-out delivery is retried after the normal settle.
 func (o *outbound) sendFailed(key domain.Key, err error) error {
 	if isFatal(err) {
 		o.log.Error("screen post failed with a fatal telegram error", slog.String("key", key.String()), slog.String("err", err.Error()))
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		o.log.Debug("screen post cancelled", slog.String("key", key.String()))
+		o.log.Debug("screen post deferred", slog.String("key", key.String()))
+		o.deb.Schedule(key)
 		return nil
 	}
 	o.log.Warn("screen post failed", slog.String("key", key.String()), slog.String("err", err.Error()))

@@ -112,7 +112,7 @@ const (
 	OptionPostsChrome = "posts.chrome"
 	// ChoiceSourceDone is the static list of DoneMode values.
 	ChoiceSourceDone = "done"
-	// OptionPostsReactions puts 👀 on the operator's prompt once the agent
+	// OptionPostsReactions puts 👀 on every operator input once the agent
 	// took it and 👌 when that turn ends. Off by default since 0.9.1: the
 	// reactions were one more notification in a group that already rings.
 	OptionPostsReactions = "posts.reactions"

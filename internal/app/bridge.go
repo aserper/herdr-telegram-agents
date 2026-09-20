@@ -34,6 +34,8 @@ type Bridge struct {
 
 	// CallTimeout bounds one job; tests shorten it.
 	CallTimeout time.Duration
+	// ActivityInterval controls polling Pi transcript activity cards.
+	ActivityInterval time.Duration
 }
 
 // Services are the optional machine-side helpers the bridge uses: the
@@ -67,18 +69,19 @@ func NewBridge(cfg domain.Config, herdr domain.HerdrGateway, tg domain.TelegramG
 	out := newOutbound(herdr, tg, cfg.ChatID, cfg.OperatorIDs, topics, registry.Agent, registry.Live, capture, opts, svc.Replies, clock, log)
 	in := newInbound(herdr, tg, topics, registry.Agent, registry.Live, out, opts, svc, cfg, clock, log)
 	b := &Bridge{
-		out:         out,
-		in:          in,
-		jobs:        make(chan any, bridgeBuffer),
-		fatal:       make(chan error, 1),
-		log:         log,
-		CallTimeout: bridgeCallTimeout,
+		out:              out,
+		in:               in,
+		jobs:             make(chan any, bridgeBuffer),
+		fatal:            make(chan error, 1),
+		log:              log,
+		CallTimeout:      bridgeCallTimeout,
+		ActivityInterval: 2 * time.Second,
 	}
-	// Slow work (agent.start, a file download) runs off the loop and
-	// reports back as a job, so the bridge stays the only writer to
-	// Telegram.
-	in.async = func(run func(context.Context) any) {
-		b.spawn(func(ctx context.Context) { b.Submit(run(ctx)) })
+	// Slow work runs off the loop and reports completion as a job. Most
+	// Telegram writes stay on the bridge; /reply is the exception because
+	// a complete multipart send can outlive one bridge call deadline.
+	in.async = func(timeout time.Duration, run func(context.Context) any) {
+		b.spawn(timeout, func(ctx context.Context) { b.submitAsync(ctx, run(ctx)) })
 	}
 	return b
 }
@@ -96,9 +99,9 @@ type startResult struct {
 	started   time.Time
 }
 
-// spawn runs fn on its own goroutine with a context bound to Run and
-// asyncTimeout; Run waits for every spawned goroutine.
-func (b *Bridge) spawn(fn func(context.Context)) {
+// spawn runs fn on its own goroutine with a context bound to Run and the
+// supplied timeout; Run waits for every spawned goroutine.
+func (b *Bridge) spawn(timeout time.Duration, fn func(context.Context)) {
 	parent := b.runCtx
 	if parent == nil {
 		parent = context.Background()
@@ -106,7 +109,13 @@ func (b *Bridge) spawn(fn func(context.Context)) {
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
-		ctx, cancel := context.WithTimeout(parent, asyncTimeout)
+		var ctx context.Context
+		var cancel context.CancelFunc
+		if timeout > 0 {
+			ctx, cancel = context.WithTimeout(parent, timeout)
+		} else {
+			ctx, cancel = context.WithCancel(parent)
+		}
 		defer cancel()
 		fn(ctx)
 	}()
@@ -154,7 +163,7 @@ func (b *Bridge) Fatal() <-chan error { return b.fatal }
 // next event or a resync brings the state back.
 func (b *Bridge) Submit(job any) {
 	switch job.(type) {
-	case AgentEvent, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, presenceAway, startResult, inboxResult:
+	case AgentEvent, domain.TopicMessage, domain.TopicAttachment, domain.ButtonPressed, domain.GeneralCommand, presenceAway, startResult, inboxResult, replyResult:
 	default:
 		b.log.Warn("bridge job of unknown type dropped", slog.String("type", fmt.Sprintf("%T", job)))
 		return
@@ -164,6 +173,17 @@ func (b *Bridge) Submit(job any) {
 	default:
 		n := b.dropped.Add(1)
 		b.log.Debug("bridge overflow, job dropped", slog.String("type", fmt.Sprintf("%T", job)), slog.Int64("dropped", n))
+	}
+}
+
+// submitAsync reliably returns a background completion to the bridge. Unlike
+// external event submission it waits for queue space, because dropping a
+// completion could hide a fatal Telegram error or leave per-job state stuck.
+func (b *Bridge) submitAsync(ctx context.Context, job any) {
+	select {
+	case b.jobs <- job:
+	case <-ctx.Done():
+		b.log.Debug("background completion cancelled", slog.String("type", fmt.Sprintf("%T", job)))
 	}
 }
 
@@ -186,6 +206,8 @@ func (b *Bridge) Run(ctx context.Context) {
 	}()
 	b.runCtx = ctx
 	defer b.wg.Wait()
+	activity := time.NewTicker(b.ActivityInterval)
+	defer activity.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -199,6 +221,8 @@ func (b *Bridge) Run(ctx context.Context) {
 			b.run(ctx, "command", func(ctx context.Context) error { return b.in.Fire(ctx, key) })
 		case key := <-b.out.TurnDue():
 			b.run(ctx, "turn", func(ctx context.Context) error { return b.out.EndTurn(ctx, key) })
+		case <-activity.C:
+			b.run(ctx, "activity", b.out.Activity)
 		}
 	}
 }
@@ -233,6 +257,9 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 	case inboxResult:
 		b.log.Debug("bridge job", slog.String("kind", "inbox_result"), slog.Int("message_id", j.messageID), slog.Int("saved", len(j.paths)), slog.Int("failed", len(j.failed)))
 		b.run(ctx, "inbox_result", func(ctx context.Context) error { return b.in.InboxFinished(ctx, j) })
+	case replyResult:
+		b.log.Debug("bridge job", slog.String("kind", "reply_result"), slog.Int("message_id", j.messageID), slog.Bool("ok", j.err == nil))
+		b.run(ctx, "reply_result", func(ctx context.Context) error { return b.in.ReplyFinished(ctx, j) })
 	case domain.GeneralCommand:
 		b.log.Debug("bridge job", slog.String("kind", "general_command"), slog.Int("message_id", j.MessageID), slog.String("role", j.Role.String()))
 		b.run(ctx, "general_command", func(ctx context.Context) error { return b.in.HandleGeneral(ctx, j) })

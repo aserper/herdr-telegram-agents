@@ -18,6 +18,7 @@ import (
 // helpText is the command list shown by /help in a topic and in General.
 const helpText = `Commands
 /screen [N|all]: post the agent screen: the whole visible screen, its last N lines, or with "all" everything since your last message
+/reply: post the agent's complete latest transcript reply with formatting (Claude Code and Pi)
 /keys k1 k2 ...: send raw keys to the agent (esc, enter, y, 1 ...)
 /focus: bring the agent's pane to the front in Herdr
 /git status | diff [staged] | log [N]: git in the agent's directory; long output arrives as a file
@@ -42,6 +43,8 @@ const (
 	// stoppedReply and interruptedReply confirm the key went out.
 	stoppedReply     = "⏹ sent esc"
 	interruptedReply = "⛔ sent ctrl+c"
+	// replyBusy prevents multipart responses in one topic from interleaving.
+	replyBusy = "a reply is already being posted"
 	// topicOnly answers an agent command written in General.
 	topicOnly = "agent commands live in the agent's topic"
 	// closePrefix marks the callback data of the /close keyboard; closeYes
@@ -135,10 +138,12 @@ type inbound struct {
 	// closing is the message id of the active /close question per agent;
 	// a newer question retires the older one. Bridge goroutine only.
 	closing map[domain.Key]int
-	// async runs a slow agent start off the bridge goroutine and delivers
-	// its result to StartFinished; the bridge wires it, tests without a
-	// bridge get the synchronous default.
-	async func(run func(context.Context) any)
+	// async runs slow work off the bridge goroutine under its own timeout
+	// and submits its result back; tests without a bridge run synchronously.
+	async func(timeout time.Duration, run func(context.Context) any)
+	// replying serializes explicit multipart transcript posts per topic.
+	replying        map[domain.Key]bool
+	deferredReplies map[domain.Key][]domain.Outgoing
 	// albums collects the parts of a media group until albumSettle passes
 	// after the last one; the debouncer key is albumKey(groupID).
 	albums map[string]*album
@@ -151,6 +156,15 @@ type followUp struct {
 	word      string
 	threadID  int
 	messageID int
+}
+
+// replyResult reports an asynchronous /reply delivery. The successful send
+// already happened; only failures need a short, sanitized Telegram response.
+type replyResult struct {
+	key       domain.Key
+	threadID  int
+	messageID int
+	err       error
 }
 
 func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *topicView, agents agentLookup,
@@ -167,14 +181,16 @@ func newInbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, topics *to
 		git: svc.Git, inbox: svc.Inbox,
 		opts: opts, panel: newPanel(opts, tg, log),
 		cfg: cfg, store: svc.Config, log: log,
-		chrome:  opts.PostsChrome,
-		clock:   clock,
-		deb:     newDebouncer(clock, commandSettle, log),
-		pending: map[domain.Key]followUp{},
-		closing: map[domain.Key]int{},
-		albums:  map[string]*album{},
+		chrome:          opts.PostsChrome,
+		clock:           clock,
+		deb:             newDebouncer(clock, commandSettle, log),
+		pending:         map[domain.Key]followUp{},
+		closing:         map[domain.Key]int{},
+		replying:        map[domain.Key]bool{},
+		deferredReplies: map[domain.Key][]domain.Outgoing{},
+		albums:          map[string]*album{},
 	}
-	in.async = func(run func(context.Context) any) {
+	in.async = func(_ time.Duration, run func(context.Context) any) {
 		_ = in.asyncDone(context.Background(), run(context.Background()))
 	}
 	return in
@@ -188,8 +204,46 @@ func (i *inbound) asyncDone(ctx context.Context, job any) error {
 		return i.StartFinished(ctx, j)
 	case inboxResult:
 		return i.InboxFinished(ctx, j)
+	case replyResult:
+		return i.ReplyFinished(ctx, j)
 	}
 	return nil
+}
+
+// ReplyFinished reports a failed background /reply without exposing local
+// transcript paths. Fatal Telegram errors still reach the bridge supervisor.
+func (i *inbound) ReplyFinished(ctx context.Context, r replyResult) error {
+	delete(i.replying, r.key)
+	deferred := i.deferredReplies[r.key]
+	delete(i.deferredReplies, r.key)
+	for _, out := range deferred {
+		if err := i.absorb(i.send(ctx, out)); err != nil {
+			return err
+		}
+	}
+	if r.err == nil {
+		return nil
+	}
+	i.log.Warn("reply delivery failed", slog.String("key", r.key.String()), slog.Int("message_id", r.messageID), slog.String("err", r.err.Error()))
+	if isFatal(r.err) {
+		return r.err
+	}
+	return i.reply(ctx, r.threadID, r.messageID, "⚠️ "+replyFailureReason(r.err))
+}
+
+func replyFailureReason(err error) string {
+	switch {
+	case errors.Is(err, domain.ErrNoReply):
+		return "no complete transcript reply is available"
+	case errors.Is(err, domain.ErrAgentGone):
+		return "agent is gone"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "reply delivery timed out and may be incomplete"
+	case errors.Is(err, context.Canceled):
+		return "reply delivery was cancelled"
+	default:
+		return "could not post the transcript reply"
+	}
 }
 
 // Due delivers agent keys whose forwarded command has settled; the owner
@@ -251,9 +305,18 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 		i.log.Debug("herdr call ok", slog.String("method", "prompt"), slog.String("key", key.String()), slog.Int("message_id", msg.MessageID))
 		return i.out.PromptSent(ctx, key, msg.ThreadID, msg.MessageID)
 	case domain.CmdKeys:
-		return i.herdrCall(ctx, msg, key, "send_keys", func(ctx context.Context) error {
-			return i.herdr.SendKeys(ctx, key.PaneID, cmd.Keys)
-		})
+		keys := cmd.Keys
+		if !strings.HasPrefix(strings.TrimSpace(msg.Text), "/") {
+			var stale bool
+			keys, stale = i.out.ShortReplyKeys(ctx, key, agent, keys)
+			if stale {
+				return i.reply(ctx, msg.ThreadID, msg.MessageID, "⚠️ question changed; wait for refreshed buttons")
+			}
+		}
+		if err := i.herdr.SendKeys(ctx, key.PaneID, keys); err != nil {
+			return i.failed(ctx, msg, key, "send_keys", err)
+		}
+		return i.out.PromptSent(ctx, key, msg.ThreadID, msg.MessageID)
 	case domain.CmdFocus:
 		return i.herdrCall(ctx, msg, key, "focus", func(ctx context.Context) error {
 			return i.herdr.Focus(ctx, key.PaneID)
@@ -276,6 +339,18 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 		if err != nil {
 			return i.failed(ctx, msg, key, "screen", err)
 		}
+		return nil
+	case domain.CmdReply:
+		if i.replying[key] {
+			return i.reply(ctx, msg.ThreadID, msg.MessageID, replyBusy)
+		}
+		i.replying[key] = true
+		if err := i.reply(ctx, msg.ThreadID, msg.MessageID, "⏳ preparing the complete transcript reply…"); err != nil {
+			return err
+		}
+		i.async(0, func(ctx context.Context) any {
+			return replyResult{key: key, threadID: msg.ThreadID, messageID: msg.MessageID, err: i.out.Reply(ctx, key, msg.MessageID)}
+		})
 		return nil
 	case domain.CmdStatus:
 		line := fmt.Sprintf("%s %s · %s · pane %s", i.opts.StatusIcons().For(agent.Status), agent.Status, agent.Label(), key.PaneID)
@@ -415,7 +490,7 @@ func (i *inbound) forward(ctx context.Context, msg domain.TopicMessage, key doma
 		slog.Int("thread_id", msg.ThreadID), slog.Int("message_id", msg.MessageID),
 		slog.String("post", string(cmd.Forward.Post)), slog.Bool("dismiss", cmd.Forward.Dismiss))
 	if cmd.Forward.Post == domain.ForwardPostNone {
-		return nil
+		return i.out.PromptSent(ctx, key, msg.ThreadID, msg.MessageID)
 	}
 	if prev, ok := i.pending[key]; ok {
 		i.log.Debug("command follow-up replaced", slog.String("key", key.String()), slog.String("word", prev.word), slog.Int("message_id", prev.messageID))
@@ -423,7 +498,7 @@ func (i *inbound) forward(ctx context.Context, msg domain.TopicMessage, key doma
 	i.pending[key] = followUp{cmd: cmd, word: word, threadID: msg.ThreadID, messageID: msg.MessageID}
 	i.deb.Schedule(key)
 	i.log.Debug("command follow-up scheduled", slog.String("key", key.String()), slog.String("word", word), slog.Int64("delay_ms", i.deb.delay.Milliseconds()))
-	return nil
+	return i.out.PromptSent(ctx, key, msg.ThreadID, msg.MessageID)
 }
 
 // forwardRefusal names the statuses in which a forwarded command is not
@@ -539,7 +614,7 @@ func (i *inbound) HandleGeneral(ctx context.Context, cmd domain.GeneralCommand) 
 		return i.reply(ctx, 0, cmd.MessageID, i.away(parsed.Away, cmd.FromID))
 	case domain.CmdHere:
 		return i.reply(ctx, 0, cmd.MessageID, i.here(cmd.FromID))
-	case domain.CmdStop, domain.CmdInterrupt, domain.CmdClose:
+	case domain.CmdReply, domain.CmdStop, domain.CmdInterrupt, domain.CmdClose:
 		return i.reply(ctx, 0, cmd.MessageID, topicOnly)
 	case domain.CmdNew:
 		return i.startAgent(ctx, cmd, parsed)
@@ -712,7 +787,7 @@ func (i *inbound) startAgent(ctx context.Context, cmd domain.GeneralCommand, par
 		return err
 	}
 	started := i.clock.Now()
-	i.async(func(ctx context.Context) any {
+	i.async(asyncTimeout, func(ctx context.Context) any {
 		agent, err := i.herdr.StartAgent(ctx, name, kind, tab.RootPaneID, agentStartTimeout)
 		return startResult{
 			messageID: cmd.MessageID, workspace: ws.Label, kind: kind, name: name,
@@ -1002,7 +1077,7 @@ func (i *inbound) fireAlbum(_ context.Context, groupID string) error {
 // fetched and saved, and the outcome comes back as an inboxResult job.
 func (i *inbound) startDownload(key domain.Key, threadID, messageID int, caption string, parts []domain.TopicAttachment, max int64) {
 	started := i.clock.Now()
-	i.async(func(ctx context.Context) any {
+	i.async(asyncTimeout, func(ctx context.Context) any {
 		r := inboxResult{key: key, threadID: threadID, messageID: messageID, caption: caption, total: len(parts), started: started}
 		for _, at := range parts {
 			path, err := i.fetch(ctx, key, at, max)
@@ -1195,6 +1270,13 @@ func (i *inbound) reply(ctx context.Context, threadID, messageID int, text strin
 // command screens never need.
 func (i *inbound) send(ctx context.Context, out domain.Outgoing) error {
 	_, err := i.tg.Send(ctx, out)
+	if errors.Is(err, context.DeadlineExceeded) {
+		if key, ok := i.topics.KeyForThread(out.ThreadID); ok && i.replying[key] {
+			i.deferredReplies[key] = append(i.deferredReplies[key], out)
+			i.log.Debug("outgoing post deferred behind transcript delivery", slog.String("key", key.String()), slog.Int("reply_to", out.ReplyTo))
+			return nil
+		}
+	}
 	return err
 }
 

@@ -68,6 +68,91 @@ func TestOutboundBlockedAttachesButtons(t *testing.T) {
 	}
 }
 
+func TestOutboundBlockedUsesSafePiQuestion(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "pi", domain.StatusWorking)
+	a.Kind = "pi"
+	f.agents[a.Key] = a
+	f.replies.SetQuestion(a.Key, domain.Question{ID: "ask-1", Prompt: "Deploy now?", Context: "The build passed.", Options: []domain.QuestionOption{{Number: 1, Title: "Deploy", Description: "Production cluster."}, {Number: 2, Title: "Wait"}}})
+	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusBlocked)})
+	f.fire(t, 1)
+	sent := f.tg.Sent()
+	if len(sent) != 1 || !strings.Contains(sent[0].Text, "❓ Deploy now?") || !strings.Contains(sent[0].Text, "Production cluster.") || sent[0].Code || len(sent[0].Buttons) != 2 {
+		t.Fatalf("Sent = %+v", sent)
+	}
+	f.tg.Reset()
+	if err := f.out.Press(f.ctx, press(101, 1000, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if keys := f.herdr.Keys(); len(keys) != 1 || !reflect.DeepEqual(keys[0], testkit.KeysCall{Target: "p1", Keys: []string{"2", "enter"}}) {
+		t.Fatalf("Keys = %+v", keys)
+	}
+	assertCallsEqual(t, f.tg, "buttons:1000:⏳ 2 · Wait — sent", "answer:cb1:sent: 2")
+}
+
+func TestOutboundPiQuestionRejectsStaleButton(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "pi", domain.StatusWorking)
+	a.Kind = "pi"
+	f.agents[a.Key] = a
+	f.replies.SetQuestion(a.Key, domain.Question{ID: "ask-1", Prompt: "First?", Options: []domain.QuestionOption{{Number: 1, Title: "One"}, {Number: 2, Title: "Two"}}})
+	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusBlocked)})
+	f.fire(t, 1)
+	f.replies.SetQuestion(a.Key, domain.Question{ID: "ask-2", Prompt: "Second?", Options: []domain.QuestionOption{{Number: 1, Title: "Three"}, {Number: 2, Title: "Four"}}})
+	f.tg.Reset()
+	if err := f.out.Press(f.ctx, press(101, 1000, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if keys := f.herdr.Keys(); len(keys) != 0 {
+		t.Fatalf("stale button sent keys: %+v", keys)
+	}
+	assertCallsEqual(t, f.tg, "buttons:1000:", "answer:cb1:question changed")
+}
+
+func TestInboundTypedPiChoiceRejectsStaleQuestion(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "pi", domain.StatusWorking)
+	a.Kind = "pi"
+	f.agents[a.Key] = a
+	f.replies.SetQuestion(a.Key, domain.Question{ID: "ask-1", Prompt: "First?", Options: []domain.QuestionOption{{Number: 1, Title: "One"}, {Number: 2, Title: "Two"}}})
+	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusBlocked)})
+	f.fire(t, 1)
+	f.replies.SetQuestion(a.Key, domain.Question{ID: "ask-2", Prompt: "Second?", Options: []domain.QuestionOption{{Number: 1, Title: "Three"}, {Number: 2, Title: "Four"}}})
+	f.tg.Reset()
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 8, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if keys := f.herdr.Keys(); len(keys) != 0 {
+		t.Fatalf("stale typed reply sent keys: %+v", keys)
+	}
+	assertCallsEqual(t, f.tg, "send:101:⚠️ question changed; wait for refreshed buttons:reply=8")
+}
+
+func TestInboundTypedPiChoiceUsesNavigationPlan(t *testing.T) {
+	f := newBridgeFixture(t)
+	f.reactionsOn(t)
+	a := f.add(t, "p1", "t1", "pi", domain.StatusWorking)
+	a.Kind = "pi"
+	f.agents[a.Key] = a
+	f.replies.SetQuestion(a.Key, domain.Question{ID: "ask-1", Prompt: "Deploy now?", Options: []domain.QuestionOption{{Number: 1, Title: "Deploy"}, {Number: 2, Title: "Wait"}}})
+	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusBlocked)})
+	f.fire(t, 1)
+	f.tg.Reset()
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 8, "2")); err != nil {
+		t.Fatal(err)
+	}
+	if keys := f.herdr.Keys(); len(keys) != 1 || !reflect.DeepEqual(keys[0], testkit.KeysCall{Target: "p1", Keys: []string{"2", "enter"}}) {
+		t.Fatalf("Keys = %+v", keys)
+	}
+	assertCallsEqual(t, f.tg, "react:101:8:👀")
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 9, "/keys 2")); err != nil {
+		t.Fatal(err)
+	}
+	if keys := f.herdr.Keys(); len(keys) != 2 || !reflect.DeepEqual(keys[1], testkit.KeysCall{Target: "p1", Keys: []string{"2"}}) {
+		t.Fatalf("explicit keys = %+v", keys)
+	}
+}
+
 func TestOutboundBlockedWithoutChoicesHasNoButtons(t *testing.T) {
 	f := newBridgeFixture(t)
 	blockedWithDialog(t, f, "Steps:\n  1. build\n  2. test\n\nContinue? (y/n)")
@@ -99,7 +184,7 @@ func TestOutboundPressSendsDigitAndMarksButton(t *testing.T) {
 	if keys := f.herdr.Keys(); len(keys) != 1 || !reflect.DeepEqual(keys[0], testkit.KeysCall{Target: "p1", Keys: []string{"2"}}) {
 		t.Fatalf("Keys = %+v", keys)
 	}
-	assertCallsEqual(t, f.tg, "buttons:1000:✅ 2 · Зелёный", "answer:cb1:sent: 2")
+	assertCallsEqual(t, f.tg, "buttons:1000:⏳ 2 · Зелёный — sent", "answer:cb1:sent: 2")
 	if kb := f.tg.Buttons(1000); len(kb) != 1 || kb[0].Data != "done" {
 		t.Fatalf("keyboard after press = %+v", kb)
 	}
@@ -280,7 +365,7 @@ func TestOutboundEditFailureIsAbsorbed(t *testing.T) {
 	if err := f.out.Press(f.ctx, press(101, 1000, "2")); err != nil {
 		t.Fatalf("edit failure must be absorbed, got %v", err)
 	}
-	assertCallsEqual(t, f.tg, "buttons:1000:✅ 2 · Зелёный", "answer:cb1:sent: 2")
+	assertCallsEqual(t, f.tg, "buttons:1000:⏳ 2 · Зелёный — sent", "answer:cb1:sent: 2")
 	if n := len(f.herdr.Keys()); n != 1 {
 		t.Fatalf("Keys = %d", n)
 	}
@@ -481,14 +566,14 @@ func TestOutboundMultiSelectToggleAndSubmit(t *testing.T) {
 	if keys := f.herdr.Keys(); len(keys) != 2 || keys[1].Keys[0] != "enter" {
 		t.Fatalf("Keys = %+v", keys)
 	}
-	assertCallsEqual(t, f.tg, "buttons:1000:✅ submitted", "answer:cb1:submitted")
+	assertCallsEqual(t, f.tg, "buttons:1000:⏳ submitted · waiting for agent", "answer:cb1:submitted")
 	f.tg.Reset()
 	f.herdr.SetScreen("p1", secondDialog)
 	f.fire(t, 1)
 	if sent := f.tg.Sent(); len(sent) != 1 || len(sent[0].Buttons) != 3 {
 		t.Fatalf("follow-up Sent = %+v", sent)
 	}
-	if kb := f.tg.Buttons(1000); len(kb) != 1 || kb[0].Text != "✅ submitted" {
+	if kb := f.tg.Buttons(1000); len(kb) != 1 || kb[0].Text != "⏳ submitted · waiting for agent" {
 		t.Fatalf("submitted keyboard changed: %+v", kb)
 	}
 }
@@ -519,7 +604,7 @@ func TestOutboundSubmitWalksToTheSubmitRow(t *testing.T) {
 	if keys := f.herdr.Keys(); len(keys) != 1 || !reflect.DeepEqual(keys[0], want) {
 		t.Fatalf("Keys = %+v", keys)
 	}
-	assertCallsEqual(t, f.tg, "buttons:1000:✅ submitted", "answer:cb1:submitted")
+	assertCallsEqual(t, f.tg, "buttons:1000:⏳ submitted · waiting for agent", "answer:cb1:submitted")
 }
 
 func TestOutboundSubmitReadsTheCursorAgain(t *testing.T) {

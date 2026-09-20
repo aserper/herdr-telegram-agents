@@ -1842,3 +1842,92 @@ func TestCleanScreen(t *testing.T) {
 		t.Errorf("cleanScreen plain = %q, %d", got, n)
 	}
 }
+
+func TestAppendReplyTasks(t *testing.T) {
+	tasks := []domain.ReplyTask{
+		{Title: "Finished thing", Status: "completed"},
+		{Title: "Current thing", Status: "in-progress"},
+		{Title: "Later thing", Status: "not-started"},
+	}
+	want := "Answer\n\n## Tasks\n- ✅ Finished thing\n- 🔄 Current thing\n- ⬜ Later thing"
+	if got := appendReplyTasks("  Answer\n", tasks); got != want {
+		t.Fatalf("appendReplyTasks() = %q, want %q", got, want)
+	}
+}
+
+func TestOutboundActivityCardTracksPiToolsAndSubagents(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "pi", domain.StatusWorking)
+	a.Kind = "pi"
+	f.agents[a.Key] = a
+	f.replies.SetActivity(a.Key, domain.ActivitySnapshot{
+		ActiveTool:  "bash",
+		RecentTools: []string{"edit", "read"},
+		Subagents:   []domain.SubagentActivity{{Description: "Review auth flow", Type: "reviewer", Status: "background"}, {Description: "Map tests", Type: "Explore", Status: "completed"}},
+	})
+	if err := f.out.Activity(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Advance(activityDraftDelay)
+	if err := f.out.Activity(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	sent := f.tg.Sent()
+	if len(sent) != 1 || sent[0].Text != "⏳ Working\n▸ bash\n✓ read\n✓ edit\n🔄 reviewer — Review auth flow\n✅ Explore — Map tests" || sent[0].Notify {
+		t.Fatalf("card = %+v", sent)
+	}
+	if err := f.out.Activity(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sent := f.tg.Sent(); len(sent) != 1 {
+		t.Fatalf("duplicate card sent = %+v", sent)
+	}
+}
+
+func TestOutboundActivityDraftCleanup(t *testing.T) {
+	f := newBridgeFixture(t)
+	key := domain.Key{PaneID: "p1", TerminalID: "t1"}
+	f.out.activityCards[key] = activityCard{messageID: 77, started: f.clock.Now()}
+	if err := f.out.clearActivity(f.ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	assertCallsEqual(t, f.tg, "deletemsg:77")
+	if _, ok := f.out.activityCards[key]; ok {
+		t.Fatal("draft retained after cleanup")
+	}
+}
+
+func TestOutboundPostsPiReplyWhenTurnReturnsIdle(t *testing.T) {
+	f := newBridgeFixture(t)
+	if err := f.opts.Set(f.ctx, domain.OptionPostsDone, string(domain.DoneReply), 1); err != nil {
+		t.Fatal(err)
+	}
+	a := f.add(t, "p1", "t1", "pi", domain.StatusWorking)
+	a.Kind = "pi"
+	f.agents[a.Key] = a
+	f.replies.Set(a.Key, "Pi finished the requested work.")
+	if err := f.out.PromptSent(f.ctx, a.Key, 101, 3); err != nil {
+		t.Fatal(err)
+	}
+	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusIdle)})
+	f.fire(t, 1)
+	if sent := f.tg.Sent(); len(sent) != 1 || sent[0].Text != "Pi finished the requested work." {
+		t.Fatalf("Pi idle reply = %+v", sent)
+	}
+}
+
+func TestOutboundPostsPiQuestionWhileWorking(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "pi", domain.StatusWorking)
+	a.Kind = "pi"
+	f.agents[a.Key] = a
+	f.replies.SetQuestion(a.Key, domain.Question{ID: "ask-1", Prompt: "Deploy now?", Options: []domain.QuestionOption{{Number: 1, Title: "Deploy"}, {Number: 2, Title: "Wait"}}})
+	if err := f.out.Activity(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.fire(t, 1)
+	sent := f.tg.Sent()
+	if len(sent) != 1 || sent[0].Text != "❓ Deploy now?\n\n1. Deploy\n\n2. Wait" || len(sent[0].Buttons) != 2 {
+		t.Fatalf("Pi question = %+v", sent)
+	}
+}

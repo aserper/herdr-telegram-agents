@@ -66,6 +66,74 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timeout waiting for %s", what)
 }
 
+type blockingReplySource struct {
+	started chan time.Duration
+	release chan struct{}
+	text    string
+}
+
+func (s *blockingReplySource) LastReply(ctx context.Context, _ domain.Agent) (domain.Reply, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		s.started <- 0
+	} else {
+		s.started <- time.Until(deadline)
+	}
+	select {
+	case <-s.release:
+		return domain.Reply{Text: s.text}, nil
+	case <-ctx.Done():
+		return domain.Reply{}, ctx.Err()
+	}
+}
+
+func TestBridgeReplyRunsOffLoopUntilRunEnds(t *testing.T) {
+	r := newRunningBridge(t)
+	a := r.add(t, "p1", "t1", "reviewer", domain.StatusDone)
+	a.Kind = "pi"
+	r.agents[a.Key] = a
+	source := &blockingReplySource{
+		started: make(chan time.Duration, 1),
+		release: make(chan struct{}),
+		text:    "# Complete\n\ncomplete reply",
+	}
+	r.bridge.out.replies = source
+	r.bridge.CallTimeout = 20 * time.Millisecond
+
+	r.bridge.Submit(topicMsg(101, 11, "/reply"))
+	var deadline time.Duration
+	select {
+	case deadline = <-source.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reply lookup did not start")
+	}
+	if deadline != 0 {
+		t.Fatalf("reply deadline = %v, want Bridge.Run cancellation without a fixed deadline", deadline)
+	}
+
+	// The blocked transcript lookup must not hold up the bridge loop, and a
+	// second request in the same topic must not start an interleaved sender.
+	r.bridge.Submit(topicMsg(101, 12, "/reply"))
+	r.bridge.Submit(topicMsg(101, 13, "/status"))
+	waitUntil(t, "reply acknowledgement, busy reply and status while reply is blocked", func() bool { return len(r.tg.Sent()) >= 3 })
+	if got := r.tg.Sent()[0]; got.ReplyTo != 11 || !strings.Contains(got.Text, "preparing") {
+		t.Fatalf("reply acknowledgement = %+v", got)
+	}
+	if got := r.tg.Sent()[1]; got.ReplyTo != 12 || got.Text != replyBusy {
+		t.Fatalf("busy reply = %+v", got)
+	}
+	if got := r.tg.Sent()[2]; got.ReplyTo != 13 || !strings.Contains(got.Text, "done") {
+		t.Fatalf("status = %+v", got)
+	}
+
+	close(source.release)
+	waitUntil(t, "complete reply", func() bool { return len(r.tg.Sent()) >= 4 })
+	got := r.tg.Sent()[3]
+	if got.ReplyTo != 11 || !got.Markdown || got.MaxParts != 0 || got.Text != strings.TrimSpace(source.text) {
+		t.Fatalf("reply = %+v", got)
+	}
+}
+
 func TestBridgeRunsJobsInOrder(t *testing.T) {
 	r := newRunningBridge(t)
 	r.reactionsOn(t)
@@ -202,7 +270,7 @@ func TestBridgeServesButtonPress(t *testing.T) {
 	r.bridge.Submit(press(101, 1000, "3"))
 	waitUntil(t, "press served", func() bool { return len(r.herdr.Keys()) == 1 })
 	waitUntil(t, "answer sent", func() bool { return len(r.tg.Calls()) == 3 })
-	assertCallsEqual(t, r.tg, r.tg.Calls()[0], "buttons:1000:✅ 3 · Синий", "answer:cb1:sent: 3")
+	assertCallsEqual(t, r.tg, r.tg.Calls()[0], "buttons:1000:⏳ 3 · Синий — sent", "answer:cb1:sent: 3")
 }
 
 func TestBridgeForgetsOnAgentGone(t *testing.T) {

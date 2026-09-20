@@ -1,10 +1,13 @@
 package telegram_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/permgps/herdr-telegram-agents/internal/adapters/telegram"
 	"github.com/permgps/herdr-telegram-agents/internal/domain"
@@ -520,6 +523,93 @@ func TestSendMaxPartsTrailer(t *testing.T) {
 	}
 	if got := calls[0].form.Get("text"); strings.Contains(got, "chars)") {
 		t.Error("trailer on a non-final part")
+	}
+}
+
+func TestSendKeepsMultipartReplyTogetherPerTopic(t *testing.T) {
+	h := newHarness(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	first := true
+	h.api.on("sendMessage", func(form url.Values) apiReply {
+		if first && strings.Contains(form.Get("text"), "A-") {
+			first = false
+			close(started)
+			<-release
+		}
+		return okReply(map[string]any{"message_id": 1})
+	})
+	a := strings.Repeat("A-"+strings.Repeat("x", 3900)+"\n", 3)
+	aDone := make(chan error, 1)
+	bDone := make(chan error, 1)
+	go func() { _, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: a}); aDone <- err }()
+	<-started
+	go func() { _, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: "B-after-reply"}); bDone <- err }()
+	close(release)
+	if err := <-aDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-bDone; err != nil {
+		t.Fatal(err)
+	}
+	calls := h.api.callsOf("sendMessage")
+	if len(calls) < 4 {
+		t.Fatalf("calls=%d, want three A parts and B", len(calls))
+	}
+	for index, call := range calls[:len(calls)-1] {
+		if !strings.Contains(call.form.Get("text"), "A-") {
+			t.Fatalf("part %d interleaved before reply completed: %q", index, call.form.Get("text"))
+		}
+	}
+	if got := calls[len(calls)-1].form.Get("text"); !strings.Contains(got, "B-after-reply") {
+		t.Fatalf("last call=%q, want the deferred same-topic post", got)
+	}
+}
+
+func TestSendSameTopicWaitHonorsContext(t *testing.T) {
+	h := newHarness(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h.api.on("sendMessage", func(url.Values) apiReply {
+		close(started)
+		<-release
+		return okReply(map[string]any{"message_id": 1})
+	})
+	firstDone := make(chan error, 1)
+	go func() { _, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: "first"}); firstDone <- err }()
+	<-started
+	ctx, cancel := context.WithTimeout(h.ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, err := h.gw.Send(ctx, domain.Outgoing{ThreadID: 42, Text: "second"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("same-topic wait err=%v, want deadline exceeded", err)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSendMarkdownWithoutPartCapIsComplete(t *testing.T) {
+	h := newHarness(t)
+	n := 0
+	h.api.on("sendMessage", func(url.Values) apiReply {
+		n++
+		return okReply(map[string]any{"message_id": n})
+	})
+	var text strings.Builder
+	for i := 0; i < 17; i++ {
+		fmt.Fprintf(&text, "part-%02d %s\n", i, strings.Repeat("x", 3900))
+	}
+	id, err := h.gw.Send(h.ctx, domain.Outgoing{ThreadID: 42, Text: text.String(), Markdown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := h.api.callsOf("sendMessage")
+	if len(calls) < 16 || id != len(calls) {
+		t.Fatalf("calls=%d id=%d, want more than 15 complete parts", len(calls), id)
+	}
+	if got := calls[len(calls)-1].form.Get("text"); !strings.Contains(got, "part-16") {
+		t.Fatalf("last part does not contain the end of the reply: %.80q", got)
 	}
 }
 
