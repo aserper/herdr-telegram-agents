@@ -78,9 +78,10 @@ func (r *Reader) lastPiReply(ctx context.Context, home string, agent domain.Agen
 }
 
 // PendingQuestion returns a Pi ask_user request only while it is the active
-// unresolved tool call. It deliberately declines multi-select and free-form
-// forms: their overlay state cannot be reconstructed safely from JSONL, so
-// terminal dialog parsing remains the fallback for those forms.
+// unresolved tool call. It deliberately declines multi-select and explicitly
+// free-form/comment forms. Pi's JSONL serializer drops explicit false values,
+// so absent boolean flags are treated as false; only the listed option actions
+// are exposed to Telegram.
 func (r *Reader) PendingQuestion(ctx context.Context, agent domain.Agent) (domain.Question, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.Question{}, err
@@ -373,7 +374,7 @@ func pendingPiQuestionIn(path string, maxScan int64) (domain.Question, piScanSta
 							continue
 						}
 						var args piAskUserArgs
-						if json.Unmarshal(content.Arguments, &args) != nil || (args.AllowMultiple != nil && *args.AllowMultiple) || args.AllowFreeform == nil || *args.AllowFreeform || args.AllowComment == nil || *args.AllowComment || strings.TrimSpace(args.Question) == "" || len(args.Options) < 2 || len(args.Options) > domain.MaxChoiceButtons {
+						if json.Unmarshal(content.Arguments, &args) != nil || (args.AllowMultiple != nil && *args.AllowMultiple) || (args.AllowFreeform != nil && *args.AllowFreeform) || (args.AllowComment != nil && *args.AllowComment) || strings.TrimSpace(args.Question) == "" || len(args.Options) < 2 || len(args.Options) > domain.MaxChoiceButtons {
 							return domain.Question{}, stats, fmt.Errorf("%w: unsupported ask_user form", domain.ErrNoQuestion)
 						}
 						if content.ID == "" {

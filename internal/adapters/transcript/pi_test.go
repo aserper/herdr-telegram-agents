@@ -147,12 +147,20 @@ func TestPendingPiQuestion(t *testing.T) {
 	if !errors.Is(err, domain.ErrNoQuestion) {
 		t.Fatalf("multi-select question err=%v", err)
 	}
-	if err := os.WriteFile(path, []byte(strings.Replace(data, `,"allowFreeform":false`, "", 1)), 0o600); err != nil {
+	serialized := strings.ReplaceAll(strings.ReplaceAll(data, `,"allowFreeform":false`, ""), `,"allowComment":false`, "")
+	if err := os.WriteFile(path, []byte(serialized), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err = pendingPiQuestionIn(path, defaultMaxScan)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("serialized false question=%+v err=%v, want %+v", got, err, want)
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(data, `"allowFreeform":false`, `"allowFreeform":true`, 1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, _, err = pendingPiQuestionIn(path, defaultMaxScan)
 	if !errors.Is(err, domain.ErrNoQuestion) {
-		t.Fatalf("implicit freeform question err=%v", err)
+		t.Fatalf("explicit freeform question err=%v", err)
 	}
 }
 
