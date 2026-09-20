@@ -41,6 +41,7 @@ func newRunningBridge(t *testing.T) *runningBridge {
 	b.in.agents = f.in.agents
 	b.in.live = f.in.live
 	b.out.topics, b.in.topics = f.view, f.view
+	f.out, f.in = b.out, b.in
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

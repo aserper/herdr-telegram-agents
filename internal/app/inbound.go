@@ -283,6 +283,7 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 		i.log.Info("topic message for exited agent", slog.String("key", key.String()), slog.Int("thread_id", msg.ThreadID), slog.Int("message_id", msg.MessageID))
 		return i.reply(ctx, msg.ThreadID, msg.MessageID, "agent has exited")
 	}
+	i.out.Engage(key)
 	// An open ✏️ wait takes the next plain message as the free text of
 	// the dialog, short replies included; a command ends the wait instead.
 	if !strings.HasPrefix(strings.TrimSpace(msg.Text), "/") {
@@ -423,6 +424,7 @@ func (i *inbound) PressClose(ctx context.Context, ev domain.ButtonPressed) error
 		i.log.Debug("close button for unknown thread", slog.Int("thread_id", ev.ThreadID), slog.Int("message_id", ev.MessageID))
 		return i.out.stale(ctx, ev, "topic is not mapped")
 	}
+	i.out.Engage(key)
 	if latest, ok := i.closing[key]; !ok || latest != ev.MessageID {
 		i.log.Debug("close button stale", slog.String("key", key.String()), slog.Int("message_id", ev.MessageID), slog.Int("latest_id", latest))
 		return i.out.stale(ctx, ev, "not the latest question")
@@ -806,6 +808,7 @@ func (i *inbound) StartFinished(ctx context.Context, r startResult) error {
 			slog.String("name", r.name), slog.Int64("elapsed_ms", elapsed), slog.String("err", r.err.Error()))
 		return i.reply(ctx, 0, r.messageID, fmt.Sprintf(newFailedFmt, r.kind, r.workspace, failureReason(r.err)))
 	}
+	i.out.Engage(r.agent.Key)
 	pane := r.agent.PaneID
 	if pane == "" {
 		pane = r.paneID
@@ -1027,6 +1030,7 @@ func (i *inbound) HandleAttachment(ctx context.Context, at domain.TopicAttachmen
 		i.log.Info("attachment for exited agent", slog.String("key", key.String()), slog.Int("thread_id", at.ThreadID), slog.Int("message_id", at.MessageID))
 		return i.reply(ctx, at.ThreadID, at.MessageID, "agent has exited")
 	}
+	i.out.Engage(key)
 	max := i.opts.InboxMaxBytes()
 	i.log.Info("attachment received", slog.String("key", key.String()), slog.Int("thread_id", at.ThreadID), slog.Int("message_id", at.MessageID),
 		slog.Int64("from_id", at.FromID), slog.String("attachment", string(at.Kind)), slog.Int64("size", at.Size), slog.String("mime", at.MIME),

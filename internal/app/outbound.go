@@ -98,6 +98,9 @@ type outbound struct {
 	typing map[domain.Key]typingWait
 	// activityCards is one delayed, silently edited Pi progress draft per topic.
 	activityCards map[domain.Key]activityCard
+	// engaged marks agents that Telegram has created or received input for.
+	// Automatic reads are deliberately off for every other local session.
+	engaged map[domain.Key]bool
 }
 
 type activityCard struct {
@@ -243,8 +246,16 @@ func newOutbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, chatID in
 		refresh:       map[domain.Key]int{},
 		typing:        map[domain.Key]typingWait{},
 		activityCards: map[domain.Key]activityCard{},
+		engaged:       map[domain.Key]bool{},
 	}
 }
+
+// Engage enables automatic status posts for an agent after Telegram has
+// created it or accepted a topic interaction. Explicit commands always work
+// whether or not this marker is set.
+func (o *outbound) Engage(key domain.Key) { o.engaged[key] = true }
+
+func (o *outbound) automatic(key domain.Key) bool { return o.engaged[key] }
 
 // TurnDue delivers keys whose idle timer fired; call EndTurn for each.
 func (o *outbound) TurnDue() <-chan domain.Key { return o.turnDeb.Due() }
@@ -257,7 +268,7 @@ func (o *outbound) Activity(ctx context.Context) error {
 		return nil
 	}
 	for _, agent := range o.live() {
-		if agent.Kind != "pi" || agent.Status != domain.StatusWorking {
+		if agent.Kind != "pi" || agent.Status != domain.StatusWorking || !o.automatic(agent.Key) {
 			continue
 		}
 		entry, ok := o.topics.Entry(agent.Key)
@@ -544,6 +555,13 @@ func (o *outbound) Due() <-chan domain.Key { return o.deb.Due() }
 // cleaned up by Forget, which the bridge calls with a context.
 func (o *outbound) Observe(ev AgentEvent) {
 	key := ev.Agent.Key
+	if !o.automatic(key) {
+		o.deb.Cancel(key)
+		o.turnDeb.Cancel(key)
+		delete(o.turns, key)
+		delete(o.captures, key)
+		return
+	}
 	o.observeTurn(ev)
 	if ev.Agent.Status != domain.StatusBlocked || ev.Kind == AgentGone {
 		delete(o.announced, key)
@@ -598,6 +616,7 @@ func (o *outbound) Forget(ctx context.Context, key domain.Key) error {
 	delete(o.refresh, key)
 	delete(o.activityCards, key)
 	o.endTyping(key, "exited")
+	delete(o.engaged, key)
 	return o.retire(ctx, key, "exited")
 }
 
@@ -614,6 +633,9 @@ func (o *outbound) Fire(ctx context.Context, key domain.Key) error {
 // fire is Fire with a force flag for the catch-up: force bypasses the
 // duplicate check and the quiet rules and always rings.
 func (o *outbound) fire(ctx context.Context, key domain.Key, force bool) error {
+	if !o.automatic(key) {
+		return o.skip(key, "no Telegram interaction")
+	}
 	agent, ok := o.agents(key)
 	if !ok {
 		return o.skip(key, "exited")
@@ -1000,7 +1022,7 @@ func betterCapture(first, second string) (string, bool) {
 func (o *outbound) CatchUp(ctx context.Context) error {
 	var blocked, posted, skipped int
 	for _, a := range o.live() {
-		if a.Status != domain.StatusBlocked {
+		if a.Status != domain.StatusBlocked || !o.automatic(a.Key) {
 			continue
 		}
 		blocked++

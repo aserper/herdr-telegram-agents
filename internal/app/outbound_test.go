@@ -103,6 +103,7 @@ func (f *bridgeFixture) add(t *testing.T, pane, term, name string, st domain.Sta
 	f.mapping.Link(a.Key, topic, a, tb0)
 	f.view.publish(f.mapping)
 	f.agents[a.Key] = a
+	f.out.Engage(a.Key)
 	f.tg.Reset()
 	return a
 }
@@ -137,6 +138,25 @@ func (f *bridgeFixture) fireAfter(t *testing.T, d time.Duration, want int) {
 	case key := <-f.out.Due():
 		t.Fatalf("unexpected extra due key %v", key)
 	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestOutboundUntouchedAgentDoesNotCaptureOrPost(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusWorking)
+	delete(f.out.engaged, a.Key) // Simulate an agent never touched through Telegram.
+	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusDone)})
+	f.clock.Advance(screenSettle)
+	select {
+	case key := <-f.out.Due():
+		t.Fatalf("unexpected automatic capture for %v", key)
+	default:
+	}
+	if got := f.herdr.Reads(); len(got) != 0 {
+		t.Fatalf("automatic reads = %+v, want none", got)
+	}
+	if got := f.tg.Sent(); len(got) != 0 {
+		t.Fatalf("automatic posts = %+v, want none", got)
 	}
 }
 
@@ -313,6 +333,7 @@ func TestOutboundSendErrorPolicy(t *testing.T) {
 func TestOutboundScreenOnRequest(t *testing.T) {
 	f := newBridgeFixture(t)
 	a := f.add(t, "p1", "t1", "a", domain.StatusWorking)
+	delete(f.out.engaged, a.Key) // Explicit /screen must still work untouched.
 	f.mapping.Mute(a.Key, tb0)
 	f.view.publish(f.mapping)
 	f.herdr.SetScreen("p1", "full screen\n")
@@ -1469,6 +1490,7 @@ func TestOutboundBlockedDelayCatchUpNeverWaits(t *testing.T) {
 	if err := f.out.Forget(f.ctx, a.Key); err != nil {
 		t.Fatal(err)
 	}
+	f.out.Engage(a.Key)
 	f.herdr.SetScreen("p1", "Fresh question?\n1. Yes\n2. No")
 	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusBlocked)})
 	f.fire(t, 1)

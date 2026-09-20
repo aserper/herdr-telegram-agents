@@ -346,6 +346,7 @@ func TestDaemonBlockedScreenIsPosted(t *testing.T) {
 	f.herdr.SetScreen("p1", "Allow Bash?\n1. Yes\n2. No")
 	f.start(t)
 	f.waitCalls(t, 3)
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
 
 	blocked := agent("p1", "", "", domain.StatusBlocked)
 	f.herdr.Push(domain.HerdrEvent{Kind: domain.PaneAgentStatusChanged, PaneID: "p1", Agent: &blocked})
@@ -545,6 +546,9 @@ func TestDaemonManyAgentsBurst(t *testing.T) {
 	}
 	f.start(t)
 	waitFor(t, "topics created", func() bool { return countCalls(f.tg.Calls(), "create:") == n })
+	for _, a := range manyAgents(n, domain.StatusIdle) {
+		f.bridge.Engage(a.Key)
+	}
 
 	push := func(i int, st domain.Status) {
 		a := agent(fmt.Sprintf("p%02d", i), "", "", st)
@@ -853,6 +857,7 @@ func TestDaemonQuietDefersUntilOperatorLeaves(t *testing.T) {
 	f.herdr.SetScreen("p1", "Allow Bash?\n1. Yes\n2. No")
 	f.start(t)
 	f.waitCalls(t, 2)
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
 	// No topic is created while quiet; the started notice still posts.
 	assertCalls(t, f.tg, "rights", started1)
 	if st := f.daemon.Stats(); st.Quiet != "on" || !strings.HasSuffix(app.StatsLine(st, f.clock.Now()), "quiet=on pager=off") {
@@ -905,6 +910,7 @@ func TestDaemonQuietSilentPostAndIconDrift(t *testing.T) {
 	f.herdr.SetScreen("p1", "Allow Bash?\n1. Yes\n2. No")
 	f.start(t)
 	f.waitCalls(t, 3) // rights, create, started: away at start
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
 	assertCalls(t, f.tg, "rights", "create:reviewer:working", started1)
 
 	// The operator sits down: the next sample turns quiet on.
@@ -1074,6 +1080,7 @@ func TestDaemonPagerProbeAndFallback(t *testing.T) {
 	f.herdr.SetScreen("p1", "Allow Bash?\n1. Yes\n2. No")
 	f.start(t)
 	f.waitCalls(t, 4)
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
 	assertCalls(t, f.tg, "rights", "probe:1", "send:0:⚠️ questions will ring in the topics: the bot cannot write to your private chat (open the bot and press Start)", "create:reviewer:working", started1)
 	if st := f.daemon.Stats(); st.Pager != "unreachable" || !strings.HasSuffix(app.StatsLine(st, f.clock.Now()), "pager=unreachable") {
 		t.Fatalf("Stats = %+v", st)
@@ -1129,6 +1136,7 @@ func TestDaemonPagerRingsInPrivateChat(t *testing.T) {
 	f.herdr.SetScreen("p1", "Allow Bash?\n1. Yes\n2. No")
 	f.start(t)
 	f.waitCalls(t, 4)
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
 	assertCalls(t, f.tg, "rights", "probe:1", "create:reviewer:working", started1)
 	if st := f.daemon.Stats(); st.Pager != "on" {
 		t.Fatalf("Stats = %+v", st)
