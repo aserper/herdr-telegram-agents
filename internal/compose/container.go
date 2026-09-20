@@ -6,16 +6,29 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/permgps/herdr-telegram-agents/internal/adapters/herdr"
 	"github.com/permgps/herdr-telegram-agents/internal/adapters/logging"
+	"github.com/permgps/herdr-telegram-agents/internal/adapters/remoteprompt"
 	"github.com/permgps/herdr-telegram-agents/internal/adapters/state"
 	"github.com/permgps/herdr-telegram-agents/internal/adapters/system"
 	"github.com/permgps/herdr-telegram-agents/internal/adapters/telegram"
 	"github.com/permgps/herdr-telegram-agents/internal/adapters/transcript"
 	"github.com/permgps/herdr-telegram-agents/internal/app"
 	"github.com/permgps/herdr-telegram-agents/internal/domain"
+)
+
+// The remote-panes plugin keeps the mirror bookkeeping the daemon needs to
+// route prompts for mirrored panes: its state snapshot says which local pane
+// shows which remote terminal, its config says how to reach the host. Both
+// live as sibling directories of this plugin's own directories, so they are
+// found relative to the environment rather than configured a second time.
+const (
+	remotePanesPlugin  = "poorplebs.remote-panes"
+	remotePanesStateF  = "mirrors-default.json"
+	remotePanesConfigF = "config.json"
 )
 
 // The CLI may import only compose and domain, so the application types it
@@ -229,6 +242,15 @@ func BuildDaemon(ctx context.Context, env PluginEnv, cfg domain.Config, log *slo
 		return nil, nil, nil, fmt.Errorf("herdr connect %s: %w", env.SocketPath, err)
 	}
 	closeAll = func() { _ = hg.Close() }
+	// A prompt for a local pane that mirrors a remote terminal is typed into
+	// the agent on the machine that owns the terminal, over SSH; everything
+	// else reaches the Herdr socket as before (adapters/remoteprompt).
+	gateway := remoteprompt.NewGateway(hg,
+		remoteprompt.NewRemotePanes(
+			filepath.Join(filepath.Dir(env.StateDir), remotePanesPlugin, remotePanesStateF),
+			filepath.Join(filepath.Dir(env.ConfigDir), remotePanesPlugin, remotePanesConfigF),
+			log),
+		system.NewExecRunner(log), log)
 
 	tg, run, err := telegram.Connect(ctx, cfg, log, fatal)
 	if err != nil {
@@ -279,14 +301,14 @@ func BuildDaemon(ctx context.Context, env PluginEnv, cfg domain.Config, log *slo
 		slog.Bool("from_options_file", !options.IsDefault(domain.OptionQuietEnabled)), slog.String("path", optionsStore.Path()))
 
 	clock := realClock{}
-	registry := app.NewRegistry(hg, clock, log)
-	reconciler := app.NewReconciler(tg, hg, mappings, mapping, opts, clock, log)
-	capture := app.NewCapture(hg, registry.Live, clock, log)
+	registry := app.NewRegistry(gateway, clock, log)
+	reconciler := app.NewReconciler(tg, gateway, mappings, mapping, opts, clock, log)
+	capture := app.NewCapture(gateway, registry.Live, clock, log)
 	inbox := state.NewInbox(env.StateDir, log)
-	bridge := app.NewBridge(cfg, hg, tg, registry, reconciler, capture, opts,
+	bridge := app.NewBridge(cfg, gateway, tg, registry, reconciler, capture, opts,
 		app.Services{Replies: transcript.NewReader(log), Git: system.NewGitRunner(log), Inbox: inbox, Config: state.NewConfigStore(env.ConfigDir, log)}, clock, log)
 	presence := app.NewPresence(system.NewIdleSource(log), opts, clock, log)
-	d = app.NewDaemon(cfg, hg, tg, registry, reconciler, bridge, capture, state.NewConfigStore(env.ConfigDir, log), opts, presence, clock, log)
+	d = app.NewDaemon(cfg, gateway, tg, registry, reconciler, bridge, capture, state.NewConfigStore(env.ConfigDir, log), opts, presence, clock, log)
 	d.SetInbox(inbox)
 	return d, run, closeAll, nil
 }
