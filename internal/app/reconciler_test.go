@@ -722,3 +722,43 @@ func TestReconcilerQuietDefersWritesUntilCatchUp(t *testing.T) {
 	assertCalls(t, f.tg)
 	f.rec.SetQuiet(nil)
 }
+
+// Name/icon edits flicker service notices in the group, so they follow the
+// engagement gate: creation, exit and a manual resync do not.
+func TestReconcilerEditsFollowEngagement(t *testing.T) {
+	f := newRec(t)
+	engaged := map[domain.Key]bool{}
+	f.rec.SetEngaged(func(k domain.Key) bool { return engaged[k] })
+
+	local := agent("p1", "t1", "reviewer", domain.StatusWorking)
+	tele := agent("p2", "t2", "fixer", domain.StatusWorking)
+	engaged[tele.Key] = true
+	f.handle(t, app.AgentAppeared, local)
+	f.handle(t, app.AgentAppeared, tele)
+	assertCalls(t, f.tg, "create:reviewer:working", "create:fixer:working")
+
+	// Status flips repaint only the Telegram-driven agent's icon.
+	f.handle(t, app.AgentChanged, agent("p1", "t1", "reviewer", domain.StatusIdle))
+	f.handle(t, app.AgentChanged, agent("p2", "t2", "fixer", domain.StatusBlocked))
+	f.fireDue(t, 2)
+	assertCalls(t, f.tg, "create:reviewer:working", "create:fixer:working", "edit:102:status=blocked")
+
+	// Engaging the local agent re-enables its edits. The skipped idle edit
+	// never reached the mapping, so done is the first recorded change.
+	engaged[local.Key] = true
+	f.handle(t, app.AgentChanged, agent("p1", "t1", "reviewer", domain.StatusDone))
+	f.fireDue(t, 1)
+	assertCalls(t, f.tg, "create:reviewer:working", "create:fixer:working", "edit:102:status=blocked", "edit:101:status=done")
+
+	// A manual resync rewrites every live topic regardless of engagement.
+	delete(engaged, local.Key)
+	delete(engaged, tele.Key)
+	if err := f.rec.Resync(f.ctx, []domain.Agent{
+		agent("p1", "t1", "reviewer", domain.StatusDone),
+		agent("p2", "t2", "fixer", domain.StatusBlocked),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertCalls(t, f.tg, "create:reviewer:working", "create:fixer:working", "edit:102:status=blocked", "edit:101:status=done",
+		"edit:101:name=reviewer,status=done", "edit:102:name=fixer,status=blocked")
+}

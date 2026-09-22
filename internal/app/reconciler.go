@@ -41,6 +41,11 @@ type Reconciler struct {
 	// sweep at one line per daemon run.
 	sweepRightsWarned bool
 	force             bool // set by Resync for the duration of one pass
+	// engaged, when set, limits name/icon edits to Telegram-driven agents;
+	// set once by NewBridge before Run. nil edits every agent (standalone
+	// reconciler tests). Creation, exit housekeeping and resync rewrites
+	// stay unconditional either way.
+	engaged func(domain.Key) bool
 	// view is the read-only copy of the mapping the bridge goroutine
 	// consults; it is republished after every save.
 	view *topicView
@@ -81,6 +86,19 @@ func (r *Reconciler) SetQuiet(fn func() bool) {
 		fn = func() bool { return false }
 	}
 	r.quiet = fn
+}
+
+// SetEngaged limits name/icon edits to agents Telegram drives: every edit
+// posts a "changed the topic icon" service notice, so a locally started
+// session flips icons in the group even when nothing else reaches it.
+// Topic creation, exit housekeeping and resync rewrites are not gated;
+// nil edits everything.
+func (r *Reconciler) SetEngaged(fn func(domain.Key) bool) {
+	r.engaged = fn
+}
+
+func (r *Reconciler) engaging(key domain.Key) bool {
+	return r.force || r.engaged == nil || r.engaged(key)
 }
 
 // topics returns the goroutine-safe read model of the mapping.
@@ -353,6 +371,10 @@ func (r *Reconciler) edit(ctx context.Context, key domain.Key) error {
 	}
 	if entry.Muted && !r.force {
 		r.log.Debug("topic muted, edit skipped", slog.String("key", key.String()), slog.Int("thread", entry.ThreadID))
+		return nil
+	}
+	if !r.engaging(key) {
+		r.log.Debug("topic edit skipped, agent not Telegram-driven", slog.String("key", key.String()), slog.Int("thread", entry.ThreadID))
 		return nil
 	}
 	patch, changed := r.mapping.Diff(key, a)

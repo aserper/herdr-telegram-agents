@@ -153,6 +153,7 @@ func TestDaemonStartupReconcileAndShutdown(t *testing.T) {
 	if w := f.herdr.WatchCalls(); len(w) != 1 || w[0][0] != "p1" {
 		t.Fatalf("WatchPanes = %v", w)
 	}
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
 
 	// A status event flows through registry -> reconciler -> debounce -> edit.
 	idle := agent("p1", "", "", domain.StatusIdle)
@@ -955,6 +956,7 @@ func TestDaemonAwayCommandAndQuietOption(t *testing.T) {
 	f.start(t)
 	f.waitCalls(t, 2)
 	assertCalls(t, f.tg, "rights", started1)
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
 
 	// /away from the phone catches up at once and answers.
 	f.tg.Push(domain.GeneralCommand{MessageID: 9, FromID: 1, Text: "/away 1h"})
@@ -1008,6 +1010,7 @@ func TestDaemonDashboardLifecycle(t *testing.T) {
 	f.start(t)
 	f.waitCalls(t, 3)
 	assertCalls(t, f.tg, "rights", "create:reviewer:working", started1)
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
 	// The dashboard follows after its settle: created silently in General,
 	// then pinned.
 	waitFor(t, "dashboard settle", func() bool { return f.clock.Pending() >= 7 })
@@ -1191,6 +1194,36 @@ func TestDaemonNoticeDelayApplied(t *testing.T) {
 		s := f.tg.Settings()
 		return len(s) == 3 && s[2] == "noticedelay:60"
 	})
+	if err := f.stop(t); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The engagement gate reaches the reconciler through the bridge: locally
+// started work never repaints the topic icon; once Telegram drives the
+// agent, icon edits follow again.
+func TestDaemonIconEditsFollowEngagement(t *testing.T) {
+	f := newDaemon(t)
+	f.herdr.SetAgents([]domain.Agent{agent("p1", "t1", "reviewer", domain.StatusWorking)})
+	f.start(t)
+	f.waitCalls(t, 3)
+	assertCalls(t, f.tg, "rights", "create:reviewer:working", started1)
+
+	// Locally started work: status flips do not repaint the topic icon.
+	idle := agent("p1", "", "", domain.StatusIdle)
+	f.herdr.Push(domain.HerdrEvent{Kind: domain.PaneAgentStatusChanged, PaneID: "p1", Agent: &idle})
+	waitFor(t, "debounce timer", func() bool { return f.clock.Pending() >= 7 })
+	f.clock.Advance(3 * time.Second)
+	time.Sleep(20 * time.Millisecond)
+	assertCalls(t, f.tg, "rights", "create:reviewer:working", started1)
+
+	// Once Telegram drives the agent, icons follow again.
+	f.bridge.Engage(domain.Key{PaneID: "p1", TerminalID: "t1"})
+	blocked := agent("p1", "", "", domain.StatusBlocked)
+	f.herdr.Push(domain.HerdrEvent{Kind: domain.PaneAgentStatusChanged, PaneID: "p1", Agent: &blocked})
+	waitFor(t, "debounce timer", func() bool { return f.clock.Pending() >= 7 })
+	f.clock.Advance(3 * time.Second)
+	waitFor(t, "icon edit after engage", func() bool { return f.hasCall("edit:101:status=blocked") })
 	if err := f.stop(t); err != nil {
 		t.Fatal(err)
 	}

@@ -59,9 +59,11 @@ inside a never-engaged agent posts nothing and rings nothing.
 
 Reading is free: `/status`, `/screen`, `/screen all`, `/reply`, `/options`,
 control keys and button presses all answer without engaging, so checking in
-from the phone does not light the topic up. Topic creation, icon edits and
-renames keep happening for every agent so the group always matches Herdr,
-and every explicit command works whether or not the agent is engaged.
+from the phone does not light the topic up. Topic creation still happens
+for every agent (typing in the topic is how you engage one), but name and
+icon edits wait for engagement since every flip posts a service notice;
+the manual resync action rewrites every topic regardless. Every explicit
+command works whether or not the agent is engaged.
 
 ## The dashboard
 
