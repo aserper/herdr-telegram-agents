@@ -256,6 +256,7 @@ func (i *inbound) Pending() int { return len(i.pending) }
 // typed delivers the operator's message as the free text of a dialog
 // after a ✏️ press: typed as a prompt whatever it looks like.
 func (i *inbound) typed(ctx context.Context, msg domain.TopicMessage, key domain.Key, w typingWait) error {
+	i.out.Engage(key)
 	i.log.Info("typed text delivered", slog.String("key", key.String()), slog.Int("thread_id", msg.ThreadID),
 		slog.Int("message_id", msg.MessageID), slog.Int("dialog_message_id", w.messageID), slog.Int("len", len(msg.Text)))
 	if err := i.herdr.Prompt(ctx, key.PaneID, msg.Text); err != nil {
@@ -268,6 +269,9 @@ func (i *inbound) typed(ctx context.Context, msg domain.TopicMessage, key domain
 }
 
 // HandleTopic routes one topic message: prompt, short reply or command.
+// Only messages that feed input to the agent (prompts, short replies,
+// forwarded commands) Engage automatic posts; read-only commands like
+// /status or /screen never light the topic up on their own.
 // Success is silent (the topic icon turning ⚡ shows the agent took the
 // prompt), failure gets a quoted reply. Only fatal Telegram errors are
 // returned.
@@ -283,7 +287,6 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 		i.log.Info("topic message for exited agent", slog.String("key", key.String()), slog.Int("thread_id", msg.ThreadID), slog.Int("message_id", msg.MessageID))
 		return i.reply(ctx, msg.ThreadID, msg.MessageID, "agent has exited")
 	}
-	i.out.Engage(key)
 	// An open ✏️ wait takes the next plain message as the free text of
 	// the dialog, short replies included; a command ends the wait instead.
 	if !strings.HasPrefix(strings.TrimSpace(msg.Text), "/") {
@@ -300,12 +303,14 @@ func (i *inbound) HandleTopic(ctx context.Context, msg domain.TopicMessage) erro
 	i.log.Debug("topic command text", slog.String("key", key.String()), slog.String("text", msg.Text), slog.Any("keys", cmd.Keys), slog.Int("lines", cmd.Lines))
 	switch cmd.Kind {
 	case domain.CmdPrompt:
+		i.out.Engage(key)
 		if err := i.herdr.Prompt(ctx, key.PaneID, cmd.Text); err != nil {
 			return i.failed(ctx, msg, key, "prompt", err)
 		}
 		i.log.Debug("herdr call ok", slog.String("method", "prompt"), slog.String("key", key.String()), slog.Int("message_id", msg.MessageID))
 		return i.out.PromptSent(ctx, key, msg.ThreadID, msg.MessageID)
 	case domain.CmdKeys:
+		i.out.Engage(key)
 		keys := cmd.Keys
 		if !strings.HasPrefix(strings.TrimSpace(msg.Text), "/") {
 			var stale bool
@@ -424,7 +429,6 @@ func (i *inbound) PressClose(ctx context.Context, ev domain.ButtonPressed) error
 		i.log.Debug("close button for unknown thread", slog.Int("thread_id", ev.ThreadID), slog.Int("message_id", ev.MessageID))
 		return i.out.stale(ctx, ev, "topic is not mapped")
 	}
-	i.out.Engage(key)
 	if latest, ok := i.closing[key]; !ok || latest != ev.MessageID {
 		i.log.Debug("close button stale", slog.String("key", key.String()), slog.Int("message_id", ev.MessageID), slog.Int("latest_id", latest))
 		return i.out.stale(ctx, ev, "not the latest question")
@@ -488,6 +492,7 @@ func (i *inbound) forward(ctx context.Context, msg domain.TopicMessage, key doma
 	if err := i.herdr.Prompt(ctx, key.PaneID, cmd.Text); err != nil {
 		return i.failed(ctx, msg, key, "prompt", err)
 	}
+	i.out.Engage(key)
 	i.log.Info("command forwarded", slog.String("key", key.String()), slog.String("word", word),
 		slog.Int("thread_id", msg.ThreadID), slog.Int("message_id", msg.MessageID),
 		slog.String("post", string(cmd.Forward.Post)), slog.Bool("dismiss", cmd.Forward.Dismiss))

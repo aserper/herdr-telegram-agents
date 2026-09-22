@@ -47,6 +47,22 @@ in a topic and what gets posted there is in [commands.md](commands.md).
   edits, no screen posts, until you reopen it. Reopening refreshes name and
   icon; if the agent exited meanwhile the topic gets 🏁 and is closed again.
 
+## Automatic posts follow Telegram-driven work
+
+The daemon only talks into topics for agents whose work started in Telegram.
+An agent engages the first time work reaches it from the bot — a prompt typed
+in its topic, an attachment dropped there, or an agent created with `/new` —
+and stays engaged until it exits. Only engaged agents get automatic output:
+done posts, blocked question screens and their pager rings, and the Pi
+progress draft. Everything else stays local: a task started on the computer
+inside a never-engaged agent posts nothing and rings nothing.
+
+Reading is free: `/status`, `/screen`, `/screen all`, `/reply`, `/options`,
+control keys and button presses all answer without engaging, so checking in
+from the phone does not light the topic up. Topic creation, icon edits and
+renames keep happening for every agent so the group always matches Herdr,
+and every explicit command works whether or not the agent is engaged.
+
 ## The dashboard
 
 One message of the bot in General, pinned, shows the same text as `/status`

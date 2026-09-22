@@ -1676,3 +1676,45 @@ func TestInboundObserversWithoutStore(t *testing.T) {
 		t.Fatal("observer added without a store")
 	}
 }
+
+// Automatic posts follow the work's origin: read-only topic commands never
+// engage an untouched agent, an agent-input prompt engages it for good.
+func TestInboundEngagementFollowsWorkOrigin(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusIdle)
+	f.out.Disengage(a.Key) // Untouched: no Telegram-driven work yet.
+	if f.out.automatic(a.Key) {
+		t.Fatal("untouched agent is engaged")
+	}
+	for id, text := range []string{"/status", "/screen", "/help"} {
+		if err := f.in.HandleTopic(f.ctx, topicMsg(101, id+2, text)); err != nil {
+			t.Fatalf("%s: %v", text, err)
+		}
+		if f.out.automatic(a.Key) {
+			t.Fatalf("%s engaged the agent", text)
+		}
+	}
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 9, "fix the tests")); err != nil {
+		t.Fatal(err)
+	}
+	if !f.out.automatic(a.Key) {
+		t.Fatal("prompt did not engage the agent")
+	}
+}
+
+// Buttons are passive: answering a dialog confirms the press but does not
+// turn automatic posts on for the agent.
+func TestInboundButtonPressDoesNotEngage(t *testing.T) {
+	f := newBridgeFixture(t)
+	a := f.add(t, "p1", "t1", "reviewer", domain.StatusWorking)
+	f.out.Disengage(a.Key)
+	if err := f.in.HandleTopic(f.ctx, topicMsg(101, 5, "/close")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.in.PressClose(f.ctx, closePress(101, 1000, "c:n")); err != nil {
+		t.Fatal(err)
+	}
+	if f.out.automatic(a.Key) {
+		t.Fatal("button press engaged the agent")
+	}
+}

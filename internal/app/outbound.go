@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -100,6 +101,9 @@ type outbound struct {
 	activityCards map[domain.Key]activityCard
 	// engaged marks agents that Telegram has created or received input for.
 	// Automatic reads are deliberately off for every other local session.
+	// Engage is called from inbound handlers, so engMu guards it against the
+	// bridge goroutine's reads.
+	engMu   sync.Mutex
 	engaged map[domain.Key]bool
 }
 
@@ -250,12 +254,29 @@ func newOutbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, chatID in
 	}
 }
 
-// Engage enables automatic status posts for an agent after Telegram has
-// created it or accepted a topic interaction. Explicit commands always work
-// whether or not this marker is set.
-func (o *outbound) Engage(key domain.Key) { o.engaged[key] = true }
+// Engage enables automatic status posts for an agent once work originates
+// from Telegram: a prompt sent through the topic, an attachment, or an
+// agent the bot created. Read-only commands (/status, /screen, …) and
+// button presses never engage. Explicit commands always work whether or
+// not this marker is set.
+func (o *outbound) Engage(key domain.Key) {
+	o.engMu.Lock()
+	o.engaged[key] = true
+	o.engMu.Unlock()
+}
 
-func (o *outbound) automatic(key domain.Key) bool { return o.engaged[key] }
+// Disengage drops the marker; only tests quiet a fixture agent this way.
+func (o *outbound) Disengage(key domain.Key) {
+	o.engMu.Lock()
+	delete(o.engaged, key)
+	o.engMu.Unlock()
+}
+
+func (o *outbound) automatic(key domain.Key) bool {
+	o.engMu.Lock()
+	defer o.engMu.Unlock()
+	return o.engaged[key]
+}
 
 // TurnDue delivers keys whose idle timer fired; call EndTurn for each.
 func (o *outbound) TurnDue() <-chan domain.Key { return o.turnDeb.Due() }
@@ -616,7 +637,7 @@ func (o *outbound) Forget(ctx context.Context, key domain.Key) error {
 	delete(o.refresh, key)
 	delete(o.activityCards, key)
 	o.endTyping(key, "exited")
-	delete(o.engaged, key)
+	o.Disengage(key)
 	return o.retire(ctx, key, "exited")
 }
 

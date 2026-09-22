@@ -144,7 +144,7 @@ func (f *bridgeFixture) fireAfter(t *testing.T, d time.Duration, want int) {
 func TestOutboundUntouchedAgentDoesNotCaptureOrPost(t *testing.T) {
 	f := newBridgeFixture(t)
 	a := f.add(t, "p1", "t1", "reviewer", domain.StatusWorking)
-	delete(f.out.engaged, a.Key) // Simulate an agent never touched through Telegram.
+	f.out.Disengage(a.Key) // Simulate an agent never touched through Telegram.
 	f.out.Observe(AgentEvent{Kind: AgentChanged, Agent: f.setStatus(a, domain.StatusDone)})
 	f.clock.Advance(screenSettle)
 	select {
@@ -333,7 +333,7 @@ func TestOutboundSendErrorPolicy(t *testing.T) {
 func TestOutboundScreenOnRequest(t *testing.T) {
 	f := newBridgeFixture(t)
 	a := f.add(t, "p1", "t1", "a", domain.StatusWorking)
-	delete(f.out.engaged, a.Key) // Explicit /screen must still work untouched.
+	f.out.Disengage(a.Key) // Explicit /screen must still work untouched.
 	f.mapping.Mute(a.Key, tb0)
 	f.view.publish(f.mapping)
 	f.herdr.SetScreen("p1", "full screen\n")

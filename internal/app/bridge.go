@@ -148,8 +148,9 @@ func (b *Bridge) PagerReachable() bool { return b.out.PagerReachable() }
 // /status so it shows the same durations.
 func (b *Bridge) SetStatusSince(fn func() map[domain.Key]time.Time) { b.in.SetSince(fn) }
 
-// Engage marks an agent as Telegram-interacted, enabling automatic posts
-// for the rest of its current daemon lifetime.
+// Engage marks an agent as Telegram-driven, enabling automatic posts until
+// the agent exits. Tests use it to simulate Telegram-origin work; the
+// bridge itself never engages on passive interactions like buttons.
 func (b *Bridge) Engage(key domain.Key) { b.out.Engage(key) }
 
 // SetSettle overrides the screen and command settle delays (tests).
@@ -242,9 +243,6 @@ func (b *Bridge) handle(ctx context.Context, job any) {
 		}
 	case domain.ButtonPressed:
 		b.log.Debug("bridge job", slog.String("kind", "button"), slog.Int("thread_id", j.ThreadID), slog.Int("message_id", j.MessageID))
-		if key, ok := b.out.topics.KeyForThread(j.ThreadID); ok {
-			b.out.Engage(key)
-		}
 		if strings.HasPrefix(j.Data, panelPrefix) {
 			b.run(ctx, "options_button", func(ctx context.Context) error { return b.in.PressPanel(ctx, j) })
 			return
