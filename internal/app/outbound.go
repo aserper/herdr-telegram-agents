@@ -216,7 +216,7 @@ func newOutbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, chatID in
 	if live == nil {
 		live = func() []domain.Agent { return nil }
 	}
-	return &outbound{
+	o := &outbound{
 		herdr:         herdr,
 		tg:            tg,
 		chatID:        chatID,
@@ -252,6 +252,13 @@ func newOutbound(herdr domain.HerdrGateway, tg domain.TelegramGateway, chatID in
 		activityCards: map[domain.Key]activityCard{},
 		engaged:       map[domain.Key]bool{},
 	}
+	// Background screen reads scroll a working agent's terminal: confine
+	// them to agents whose work Telegram actually drives, same as the
+	// posts the reads feed.
+	if capture != nil {
+		capture.SetEngaged(o.automatic)
+	}
+	return o
 }
 
 // Engage enables automatic status posts for an agent once work originates

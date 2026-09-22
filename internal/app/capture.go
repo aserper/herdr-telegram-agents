@@ -23,11 +23,14 @@ type Capture struct {
 	clock domain.Clock
 	log   *slog.Logger
 
-	mu     sync.Mutex
-	hist   map[domain.Key]*domain.History
-	last   map[domain.Key]string // SHA-256 of the last screen merged per key
-	status map[domain.Key]domain.Status
-	left   map[domain.Key]time.Time // when the agent last left working
+	mu   sync.Mutex
+	hist map[domain.Key]*domain.History
+	// engaged, when set, limits reads to Telegram-driven agents; a nil
+	// predicate keeps the old read-everything behaviour (standalone tests).
+	engaged func(domain.Key) bool
+	last    map[domain.Key]string // SHA-256 of the last screen merged per key
+	status  map[domain.Key]domain.Status
+	left    map[domain.Key]time.Time // when the agent last left working
 
 	// Interval is the tick between reads; Grace keeps reading after an
 	// agent left working so its final screen is committed; MinAway is the
@@ -106,6 +109,17 @@ func (c *Capture) Observe(ev AgentEvent) {
 	}
 }
 
+// SetEngaged limits background reads to agents Telegram actually drives.
+// Reading a working agent's screen scrolls its terminal, so capturing a
+// session the operator never sent to Telegram is exactly what the
+// engagement gate exists to prevent; without it the gate would stop the
+// posts but not the scrolling.
+func (c *Capture) SetEngaged(fn func(domain.Key) bool) {
+	c.mu.Lock()
+	c.engaged = fn
+	c.mu.Unlock()
+}
+
 // Run reads the screens of working agents on every tick until ctx is done.
 func (c *Capture) Run(ctx context.Context) {
 	c.log.Info("capture started", slog.Int64("interval_ms", c.Interval.Milliseconds()), slog.Int("lines", captureLines))
@@ -120,7 +134,8 @@ func (c *Capture) Run(ctx context.Context) {
 	}
 }
 
-// tick captures every agent that is working or left working within Grace.
+// tick captures every engaged agent that is working or left working
+// within Grace.
 func (c *Capture) tick(ctx context.Context) {
 	now := c.clock.Now()
 	for _, a := range c.live() {
@@ -130,8 +145,18 @@ func (c *Capture) tick(ctx context.Context) {
 		if a.Status != domain.StatusWorking && !c.inGrace(a.Key, now) {
 			continue
 		}
+		if !c.engaging(a.Key) {
+			continue
+		}
 		c.capture(ctx, a.Key)
 	}
+}
+
+func (c *Capture) engaging(key domain.Key) bool {
+	c.mu.Lock()
+	fn := c.engaged
+	c.mu.Unlock()
+	return fn == nil || fn(key)
 }
 
 func (c *Capture) inGrace(key domain.Key, now time.Time) bool {

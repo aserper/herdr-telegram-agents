@@ -265,3 +265,20 @@ func TestCaptureShortFlapDoesNotMark(t *testing.T) {
 		t.Fatalf("mark after a real pause: first line %q, want L17", lines[0])
 	}
 }
+
+// With an engagement predicate set, ticks touch only Telegram-driven
+// agents: reading a working agent scrolls its terminal, so local sessions
+// must not even be read.
+func TestCaptureTickSkipsUnengagedAgents(t *testing.T) {
+	f := newCaptureFixture(t)
+	engaged := f.agent("p1", domain.StatusWorking)
+	f.agent("p2", domain.StatusWorking)
+	f.herdr.SetScreen("p1", text(1, 20))
+	f.herdr.SetScreen("p2", text(1, 20))
+	f.capture.SetEngaged(func(key domain.Key) bool { return key == engaged.Key })
+
+	f.capture.tick(f.ctx)
+	if reads := f.herdr.Reads(); len(reads) != 1 || reads[0].Target != "p1" {
+		t.Fatalf("Reads = %+v, want only the engaged pane", reads)
+	}
+}
