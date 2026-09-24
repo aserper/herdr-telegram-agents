@@ -315,8 +315,9 @@ func joinLines(lines []string) string {
 func TestPendingPiActivityTracksActiveAndCompletedTools(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	base := time.Date(2026, 9, 19, 20, 0, 0, 0, time.UTC)
-	// The two pending calls in the newest message are running right now;
-	// the arguments carry values a card must never show.
+	// The two pending calls in the newest message are running right now.
+	// The read shows its path relative to the agent's cwd; the grep key
+	// is an argument a card must never show.
 	live := fmt.Sprintf(`{"type":"message","id":"a3","parentId":"r2","timestamp":%q,"message":{"role":"assistant","stopReason":"toolUse","content":[`+
 		`{"type":"toolCall","id":"c3","name":"read","arguments":{"path":"/home/amit/secrets.txt"}},`+
 		`{"type":"toolCall","id":"c4","name":"grep","arguments":{"pattern":"password"}}]}}`, base.Add(5*time.Second).Format(time.RFC3339Nano))
@@ -332,11 +333,58 @@ func TestPendingPiActivityTracksActiveAndCompletedTools(t *testing.T) {
 	if err := os.WriteFile(path, []byte(joinLines(lines)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, _, err := pendingPiActivityIn(path, defaultMaxScan)
+	snapshot, _, err := pendingPiActivityIn(path, "/work", defaultMaxScan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := domain.ActivitySnapshot{ActiveTool: "📖 Reading a file", RecentTools: []string{"✍️ Editing a file", "🛠 Running command"}}
+	want := domain.ActivitySnapshot{ActiveTool: "📖 Reading /home/amit/secrets.txt", RecentTools: []string{"✍️ Editing a file", "🛠 Running command"}}
+	if !reflect.DeepEqual(snapshot, want) {
+		t.Fatalf("snapshot = %+v, want %+v", snapshot, want)
+	}
+}
+
+func TestPendingPiActivityRendersPathsRelativeToCwd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	base := time.Date(2026, 9, 19, 20, 0, 0, 0, time.UTC)
+	call := func(id, parent, callID, name, path string, offset time.Duration) string {
+		return fmt.Sprintf(`{"type":"message","id":%q,"parentId":%q,"timestamp":%q,"message":{"role":"assistant","stopReason":"toolUse","content":[{"type":"toolCall","id":%q,"name":%q,"arguments":{"path":%q}}]}}`,
+			id, parent, base.Add(offset).Format(time.RFC3339Nano), callID, name, path)
+	}
+	long := "/work/" + strings.Repeat("deep/", 12) + "leaf.go"
+	// The relative path keeps its newest 62 runes behind the ellipsis, so
+	// the tail names the file and the directories closest to it.
+	longTail := strings.Repeat("deep/", 11) + "leaf.go"
+	lines := []string{
+		piHeader("/work"),
+		piUserLine("u", nil, base, "edit some files"),
+		// A completed edit: the path comes from the indexed call, since the
+		// result itself carries no arguments.
+		call("a1", "u", "c1", "edit", "/work/internal/app/bridge.go", time.Second),
+		piResultLine("r1", ptr("a1"), base.Add(2*time.Second), "edit", "c1", `{}`),
+		// A completed read outside the cwd keeps its absolute path.
+		call("a2", "r1", "c2", "read", "/etc/hosts", 3*time.Second),
+		piResultLine("r2", ptr("a2"), base.Add(4*time.Second), "read", "c2", `{}`),
+		// An over-long path keeps its most specific trailing segments.
+		call("a3", "r2", "c3", "write", long, 5*time.Second),
+		piResultLine("r3", ptr("a3"), base.Add(6*time.Second), "write", "c3", `{}`),
+		// A file call without a path falls back to the generic label.
+		fmt.Sprintf(`{"type":"message","id":"a4","parentId":"r3","timestamp":%q,"message":{"role":"assistant","stopReason":"toolUse","content":[{"type":"toolCall","id":"c4","name":"read","arguments":{}}]}}`, base.Add(7*time.Second).Format(time.RFC3339Nano)),
+	}
+	if err := os.WriteFile(path, []byte(joinLines(lines)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := pendingPiActivityIn(path, "/work", defaultMaxScan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := domain.ActivitySnapshot{
+		ActiveTool: "📖 Reading a file",
+		RecentTools: []string{
+			"✍️ Writing …/" + longTail,
+			"📖 Reading /etc/hosts",
+			"✍️ Editing internal/app/bridge.go",
+		},
+	}
 	if !reflect.DeepEqual(snapshot, want) {
 		t.Fatalf("snapshot = %+v, want %+v", snapshot, want)
 	}
@@ -371,7 +419,7 @@ func TestPendingPiActivityCapsToolsAndStopsAtThePrompt(t *testing.T) {
 	if err := os.WriteFile(path, []byte(joinLines(lines)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, _, err := pendingPiActivityIn(path, defaultMaxScan)
+	snapshot, _, err := pendingPiActivityIn(path, "/work", defaultMaxScan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +461,7 @@ func TestPendingPiActivitySubagentRows(t *testing.T) {
 	if err := os.WriteFile(path, []byte(joinLines(lines)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, _, err := pendingPiActivityIn(path, defaultMaxScan)
+	snapshot, _, err := pendingPiActivityIn(path, "/work", defaultMaxScan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +499,7 @@ func TestPendingPiActivityCapsSubagentRows(t *testing.T) {
 	if err := os.WriteFile(path, []byte(joinLines(lines)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, _, err := pendingPiActivityIn(path, defaultMaxScan)
+	snapshot, _, err := pendingPiActivityIn(path, "/work", defaultMaxScan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +543,7 @@ func TestPendingPiActivityRefusesIdleAbortedAndEmpty(t *testing.T) {
 		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := pendingPiActivityIn(path, defaultMaxScan); !errors.Is(err, domain.ErrNoActivity) {
+		if _, _, err := pendingPiActivityIn(path, "/work", defaultMaxScan); !errors.Is(err, domain.ErrNoActivity) {
 			t.Fatalf("%s: err = %v, want ErrNoActivity", name, err)
 		}
 	}
@@ -516,7 +564,7 @@ func TestPendingPiActivityIgnoresStalePendingCall(t *testing.T) {
 	if err := os.WriteFile(path, []byte(joinLines(lines)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := pendingPiActivityIn(path, defaultMaxScan); !errors.Is(err, domain.ErrNoActivity) {
+	if _, _, err := pendingPiActivityIn(path, "/work", defaultMaxScan); !errors.Is(err, domain.ErrNoActivity) {
 		t.Fatalf("err = %v, want ErrNoActivity", err)
 	}
 }

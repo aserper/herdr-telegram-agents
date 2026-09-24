@@ -145,7 +145,7 @@ func (r *Reader) PendingActivity(ctx context.Context, agent domain.Agent) (domai
 	if err != nil {
 		return domain.ActivitySnapshot{}, fmt.Errorf("%w: transcript unavailable", domain.ErrNoActivity)
 	}
-	snapshot, stats, err := pendingPiActivityIn(path, r.maxScan)
+	snapshot, stats, err := pendingPiActivityIn(path, normalizedCwd, r.maxScan)
 	r.log.Debug("pi activity scanned", slog.String("pane", agent.PaneID), slog.String("chosen", filepath.Base(path)),
 		slog.Int("candidates", candidates), slog.Int("lines", stats.lines), slog.Int64("bytes", stats.bytes),
 		slog.Bool("found", err == nil))
@@ -409,6 +409,7 @@ const (
 	maxActivityNameLabel   = 32
 	maxActivityStatusLabel = 24
 	maxActivityDescription = 96
+	maxActivityPathLabel   = 64
 )
 
 // piSubagentTools are the tool names Pi has used to run subagents. Their
@@ -425,12 +426,16 @@ var piSubagentTools = map[string]struct{}{"Agent": {}, "subagent": {}}
 // already wrote its reply, an aborted turn and a walk that collected
 // nothing usable are reported as domain.ErrNoActivity: the card should
 // only appear while the agent is visibly working.
-func pendingPiActivityIn(path string, maxScan int64) (domain.ActivitySnapshot, piScanStats, error) {
+func pendingPiActivityIn(path, cwd string, maxScan int64) (domain.ActivitySnapshot, piScanStats, error) {
 	data, stats, err := readTail(path, maxScan)
 	if err != nil {
 		return domain.ActivitySnapshot{}, stats, fmt.Errorf("%w: read pi transcript", domain.ErrNoActivity)
 	}
 	records := make(map[string]piRecord)
+	// The walk meets a tool result before the call it resolves, and a
+	// result carries no arguments, so the call arguments a completed
+	// tool's label needs are indexed in this first pass.
+	calls := make(map[string]piToolCall)
 	var leaf string
 	lines := bytes.Split(data, []byte{'\n'})
 	unterminated := len(data) > 0 && data[len(data)-1] != '\n'
@@ -450,6 +455,16 @@ func pendingPiActivityIn(path string, maxScan int64) (domain.ActivitySnapshot, p
 		if record.ID != "" {
 			records[record.ID] = record
 			leaf = record.ID
+		}
+		if record.Type == "message" {
+			var message piMessage
+			if json.Unmarshal(record.Message, &message) == nil && message.Role == "assistant" {
+				for _, block := range message.Content {
+					if block.Type == "toolCall" && block.ID != "" {
+						calls[block.ID] = piToolCall{name: block.Name, args: block.Arguments}
+					}
+				}
+			}
 		}
 	}
 
@@ -492,13 +507,17 @@ walk:
 						resolved[message.ToolCallID] = struct{}{}
 					}
 					name := strings.TrimSpace(message.ToolName)
+					call := calls[message.ToolCallID]
+					if name == "" {
+						name = strings.TrimSpace(call.name)
+					}
 					if _, isSubagent := piSubagentTools[name]; isSubagent {
 						// Subagent runs are shown as rows, not as tool
 						// labels, so the card does not list them twice.
 						subagents = append(subagents, piSubagentRows(message)...)
 						break
 					}
-					if label := piActivityToolLabel(piContentBlock{Name: name}); label != "" {
+					if label := piActivityToolLabel(piContentBlock{Name: name, Arguments: call.args}, cwd); label != "" {
 						recentTools = append(recentTools, label)
 					}
 				case "assistant":
@@ -523,7 +542,7 @@ walk:
 								continue
 							}
 							if active == "" {
-								active = piActivityToolLabel(block)
+								active = piActivityToolLabel(block, cwd)
 							}
 						}
 					}
@@ -560,10 +579,10 @@ walk:
 }
 
 // piActivityToolLabel renders an explicit public-safe activity label. Shell
-// commands, paths, arbitrary arguments and tool output are intentionally
-// excluded; only a web-search query or an Agent description is useful enough
-// to surface after sanitizing.
-func piActivityToolLabel(block piContentBlock) string {
+// commands, arbitrary arguments and tool output are intentionally excluded;
+// the file path a file tool acts on, a web-search query and an Agent
+// description are useful enough to surface after sanitizing.
+func piActivityToolLabel(block piContentBlock, cwd string) string {
 	name := strings.TrimSpace(block.Name)
 	base := map[string]string{
 		"bash":                 "🛠 Running command",
@@ -588,9 +607,17 @@ func piActivityToolLabel(block piContentBlock) string {
 	var args struct {
 		Query       string `json:"query"`
 		Description string `json:"description"`
+		Path        string `json:"path"`
 	}
 	if json.Unmarshal(block.Arguments, &args) != nil {
 		return label
+	}
+	// A file tool names the file it works on, so the generic "a file"
+	// placeholder gives way to the path whenever the transcript carries one.
+	if verb, ok := fileToolVerbs[name]; ok {
+		if path := piActivityPath(args.Path, cwd); path != "" {
+			return verb + " " + path
+		}
 	}
 	if (name == "websearch" || name == "web_search" || name == "synthetic_web_search") && strings.TrimSpace(args.Query) != "" {
 		return label + ": " + sanitizePiText(args.Query, maxActivityDescription)
@@ -599,6 +626,48 @@ func piActivityToolLabel(block piContentBlock) string {
 		return label + ": " + sanitizePiText(args.Description, maxActivityDescription)
 	}
 	return label
+}
+
+// fileToolVerbs are the file tools whose label carries the path they act on.
+var fileToolVerbs = map[string]string{
+	"read":  "📖 Reading",
+	"write": "✍️ Writing",
+	"edit":  "✍️ Editing",
+}
+
+// piToolCall is the indexed shape of an assistant tool call: the tool name
+// and its raw arguments, kept so a later result can render a path label.
+type piToolCall struct {
+	name string
+	args json.RawMessage
+}
+
+// piActivityPath renders a file path for an activity line. A path under the
+// agent's working directory is shown relative to it, and an over-long path
+// keeps its most specific trailing segments behind an ellipsis so a card
+// line stays short without hiding which file is in play.
+func piActivityPath(value, cwd string) string {
+	// sanitizePiText only exists here for its control-character and
+	// whitespace handling; its rune cap would cut a long path from the
+	// wrong end, so the length is passed unbounded and the tail is taken
+	// below instead.
+	clean := filepath.ToSlash(strings.TrimSpace(sanitizePiText(value, len(value)+1)))
+	if clean == "" {
+		return ""
+	}
+	if filepath.IsAbs(clean) {
+		base := filepath.ToSlash(filepath.Clean(cwd))
+		if base != "" && base != "/" {
+			clean = strings.TrimPrefix(clean, base+"/")
+		}
+	}
+	// Cut the tail before anything else so a very long path keeps its
+	// most specific segments rather than its least specific prefix.
+	runes := []rune(clean)
+	if len(runes) > maxActivityPathLabel {
+		clean = "…/" + string(runes[len(runes)-(maxActivityPathLabel-2):])
+	}
+	return clean
 }
 
 // piAgentDetails is the structured summary Pi records on an Agent tool

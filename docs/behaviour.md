@@ -193,8 +193,10 @@ chain every two seconds, rendering the active tool plus a bounded eight-line
 timeline of completed tools and subagent states. The draft is removed after a
 successful idle turn, leaving the normal final reply as the durable receipt.
 
-Tool arguments, command text, paths, tool output, child-session transcripts
-and subagent prose are never used. The draft is deliberately parent-only: it
+Tool arguments, command text, tool output, child-session transcripts and
+subagent prose are never used. The one exception is the path a `read`, `write`
+or `edit` acts on, which is shown relative to the agent's working directory —
+the card is meant to say which file is in play. The draft is parent-only: it
 gives visibility without creating noisy child topics or exposing private
 intermediate conversations. Every activity line is capped at 120 runes.
 

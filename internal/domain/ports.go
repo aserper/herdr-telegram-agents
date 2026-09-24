@@ -181,12 +181,14 @@ type SubagentActivity struct {
 	Status      string
 }
 
-// ActivitySnapshot is a safe snapshot of what an agent is doing right
-// now, sized for a parent card. ActiveTool is the generic label of the
+// ActivitySnapshot is a snapshot of what an agent is doing right
+// now, sized for a parent card. ActiveTool is the label of the
 // tool the agent is waiting on, empty between calls. RecentTools lists
 // the tools finished in the current turn, newest first, capped to a few.
 // Subagents lists the most recent subagent runs, newest first, also
-// capped. Labels never contain commands, file paths or tool arguments.
+// capped. A label carries the tool name and, for a read, write or edit,
+// the file path it acts on; commands, other tool arguments and tool
+// output never appear.
 type ActivitySnapshot struct {
 	ActiveTool  string
 	RecentTools []string
